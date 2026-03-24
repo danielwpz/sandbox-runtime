@@ -13,6 +13,7 @@ import type {
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
+import { getNetworkRestrictionMode } from './sandbox-schemas.js'
 import {
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
@@ -97,12 +98,19 @@ async function filterNetworkRequest(
     return false
   }
 
+  const networkMode = getNetworkRestrictionMode(getNetworkRestrictionConfig())
+
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPattern(host, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
       return false
     }
+  }
+
+  if (networkMode === 'deny_only') {
+    logForDebugging(`Allowed by deny_only config: ${host}:${port}`)
+    return true
   }
 
   // Check allowed domains
@@ -159,6 +167,12 @@ function getMitmSocketPath(host: string): string | undefined {
   return undefined
 }
 
+function getBlockedEventDetail(): string {
+  return (config?.network.mode ?? 'allow_only') === 'deny_only'
+    ? 'blocked-by-denylist'
+    : 'blocked-by-allowlist'
+}
+
 async function startHttpProxyServer(
   sandboxAskCallback?: SandboxAskCallback,
 ): Promise<number> {
@@ -169,7 +183,7 @@ async function startHttpProxyServer(
       networkBlockedEvents.push({
         host,
         port,
-        detail: 'blocked-by-allowlist',
+        detail: getBlockedEventDetail(),
         timestamp: new Date(),
       })
     },
@@ -210,7 +224,7 @@ async function startSocksProxyServer(
       networkBlockedEvents.push({
         host,
         port,
-        detail: 'blocked-by-allowlist',
+        detail: getBlockedEventDetail(),
         timestamp: new Date(),
       })
     },
@@ -409,7 +423,17 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     }
   }
 
+  if (config.filesystem.readMode === 'allow_only') {
+    return {
+      mode: 'allow_only',
+      denyOnly: [],
+      allowOnly: allowPaths,
+      denyWithinAllow: denyPaths,
+    }
+  }
+
   return {
+    mode: 'deny_only',
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
   }
@@ -460,6 +484,7 @@ function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
   const deniedHosts = config.network.deniedDomains
 
   return {
+    mode: config.network.mode,
     ...(allowedHosts.length > 0 && { allowedHosts }),
     ...(deniedHosts.length > 0 && { deniedHosts }),
   }
@@ -601,28 +626,47 @@ async function wrapWithSandbox(
     }
   }
   const readConfig = {
-    denyOnly: expandedDenyRead,
-    allowWithinDeny: expandedAllowRead,
+    ...(customConfig?.filesystem?.readMode === 'allow_only' ||
+    (customConfig?.filesystem?.readMode === undefined &&
+      config?.filesystem.readMode === 'allow_only')
+      ? {
+          mode: 'allow_only' as const,
+          denyOnly: [],
+          allowOnly: expandedAllowRead,
+          denyWithinAllow: expandedDenyRead,
+        }
+      : {
+          mode: 'deny_only' as const,
+          denyOnly: expandedDenyRead,
+          allowWithinDeny: expandedAllowRead,
+        }),
   }
 
-  // Check if network config is specified - this determines if we need network restrictions
-  // Network restriction is needed when:
-  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
-  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
-  // An empty allowedDomains array means "no domains allowed" = block all network access
-  const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+  const effectiveNetworkMode =
+    customConfig?.network?.mode ?? config?.network.mode ?? 'allow_only'
+  const effectiveAllowedDomains =
+    customConfig?.network?.allowedDomains ?? config?.network.allowedDomains
+  const effectiveDeniedDomains =
+    customConfig?.network?.deniedDomains ?? config?.network.deniedDomains
 
-  // Network RESTRICTION is needed whenever network config is specified
-  // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
+  const needsNetworkRestriction =
+    effectiveNetworkMode === 'deny_only'
+      ? (effectiveDeniedDomains?.length ?? 0) > 0
+      : effectiveAllowedDomains !== undefined
 
-  // Network PROXY is needed whenever network config is specified
-  // Even with empty allowedDomains, we route through proxy so that:
-  // 1. updateConfig() can enable network access for already-running processes
-  // 2. The proxy blocks all requests when allowlist is empty
-  const needsNetworkProxy = hasNetworkConfig
+  // In allow_only mode the proxy is part of enforcement. In deny_only mode we
+  // only need the proxy when there are explicit deny rules to enforce.
+  const needsNetworkProxy = needsNetworkRestriction
+
+  // Wait for network initialization before reading proxy ports.
+  if (
+    needsNetworkProxy &&
+    customConfig?.network?.httpProxyPort === undefined &&
+    customConfig?.network?.socksProxyPort === undefined
+  ) {
+    await waitForNetworkInitialization()
+  }
+
   const customHttpProxyPort = customConfig?.network?.httpProxyPort
   const customSocksProxyPort = customConfig?.network?.socksProxyPort
   const httpProxyPort =
@@ -630,15 +674,6 @@ async function wrapWithSandbox(
   const socksProxyPort =
     customSocksProxyPort ??
     (needsNetworkProxy ? getSocksProxyPort() : undefined)
-
-  // Wait for network initialization only if proxy is actually needed
-  if (
-    needsNetworkProxy &&
-    customHttpProxyPort === undefined &&
-    customSocksProxyPort === undefined
-  ) {
-    await waitForNetworkInitialization()
-  }
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty

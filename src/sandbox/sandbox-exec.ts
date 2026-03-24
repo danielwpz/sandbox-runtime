@@ -233,6 +233,11 @@ function resolveEffectiveConfig(
 
   return {
     network: {
+      ...(customConfig?.network?.mode !== undefined
+        ? { mode: customConfig.network.mode }
+        : baseConfig?.network.mode !== undefined
+          ? { mode: baseConfig.network.mode }
+          : {}),
       allowedDomains:
         customConfig?.network?.allowedDomains ??
         baseConfig?.network.allowedDomains ??
@@ -273,6 +278,11 @@ function resolveEffectiveConfig(
           : {}),
     },
     filesystem: {
+      ...(customConfig?.filesystem?.readMode !== undefined
+        ? { readMode: customConfig.filesystem.readMode }
+        : baseConfig?.filesystem.readMode !== undefined
+          ? { readMode: baseConfig.filesystem.readMode }
+          : {}),
       denyRead:
         customConfig?.filesystem?.denyRead ??
         baseConfig?.filesystem.denyRead ??
@@ -354,6 +364,10 @@ function needsScopedNetworkProxy(
     return false
   }
 
+  if ((effectiveConfig.network.mode ?? 'allow_only') === 'deny_only') {
+    return effectiveConfig.network.deniedDomains.length > 0
+  }
+
   return effectiveConfig.network.allowedDomains !== undefined
 }
 
@@ -372,6 +386,9 @@ function withScopedNetworkPorts(
   return {
     ...customConfig,
     network: {
+      ...(effectiveNetworkConfig?.mode !== undefined
+        ? { mode: effectiveNetworkConfig.mode }
+        : {}),
       allowedDomains: effectiveNetworkConfig?.allowedDomains ?? [],
       deniedDomains: effectiveNetworkConfig?.deniedDomains ?? [],
       ...(effectiveNetworkConfig?.allowUnixSockets !== undefined
@@ -389,5 +406,8 @@ function withScopedNetworkPorts(
       httpProxyPort: scopedNetworkContext.httpProxyPort,
       socksProxyPort: scopedNetworkContext.socksProxyPort,
     },
+    ...(customConfig?.filesystem !== undefined
+      ? { filesystem: customConfig.filesystem }
+      : {}),
   }
 }

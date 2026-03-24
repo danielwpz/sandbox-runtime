@@ -21,6 +21,10 @@ import type {
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
+  getFsReadRestrictionMode,
+  hasFsReadRestrictions,
+} from './sandbox-schemas.js'
+import {
   generateSeccompFilter,
   cleanupSeccompFilter,
   getPreGeneratedBpfPath,
@@ -154,6 +158,65 @@ function findFirstNonExistentComponent(targetPath: string): string {
   }
 
   return targetPath // Shouldn't reach here if called correctly
+}
+
+function deriveAllowOnlyReadRoot(targetPath: string): string {
+  const normalizedPath = normalizePathForSandbox(targetPath)
+  const homePath = process.env.HOME
+    ? normalizePathForSandbox(process.env.HOME)
+    : undefined
+  const cwdPath = normalizePathForSandbox(process.cwd())
+
+  if (homePath) {
+    if (
+      normalizedPath === homePath ||
+      normalizedPath.startsWith(homePath + path.sep)
+    ) {
+      return homePath
+    }
+  }
+
+  if (
+    normalizedPath === cwdPath ||
+    normalizedPath.startsWith(cwdPath + path.sep)
+  ) {
+    return cwdPath
+  }
+
+  const segments = normalizedPath.split(path.sep).filter(Boolean)
+  if (segments.length === 0) {
+    return path.sep
+  }
+
+  if (segments[0] === 'home' || segments[0] === 'Users') {
+    return path.join(path.sep, segments[0], segments[1] ?? '')
+  }
+
+  if (segments[0] === 'var' && segments[1] === 'tmp') {
+    return path.join(path.sep, 'var', 'tmp')
+  }
+
+  return path.join(path.sep, segments[0])
+}
+
+function getAllowOnlyReadRoots(
+  allowPaths: string[],
+  denyPaths: string[],
+): string[] {
+  const roots = new Set<string>()
+
+  for (const pathStr of [...allowPaths, ...denyPaths]) {
+    roots.add(deriveAllowOnlyReadRoot(pathStr))
+  }
+
+  if (roots.size === 0) {
+    if (process.env.HOME) {
+      roots.add(normalizePathForSandbox(process.env.HOME))
+    }
+    roots.add(normalizePathForSandbox(process.cwd()))
+  }
+
+  return [...roots].filter(root => root !== path.sep)
 }
 
 /**
@@ -824,8 +887,15 @@ async function generateFilesystemArgs(
   }
 
   // Handle read restrictions by mounting tmpfs over denied paths
+  const readMode = getFsReadRestrictionMode(readConfig)
   const readDenyPaths = [...(readConfig?.denyOnly || [])]
   const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
+    normalizePathForSandbox(p),
+  )
+  const readAllowOnlyPaths = (readConfig?.allowOnly || []).map(p =>
+    normalizePathForSandbox(p),
+  )
+  const readDenyWithinAllowPaths = (readConfig?.denyWithinAllow || []).map(p =>
     normalizePathForSandbox(p),
   )
 
@@ -834,6 +904,63 @@ async function generateFilesystemArgs(
   // appear wrong inside the sandbox causing "Bad owner or permissions" errors
   if (fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')
+  }
+
+  if (readMode === 'allow_only') {
+    const protectedRoots = getAllowOnlyReadRoots(
+      readAllowOnlyPaths,
+      readDenyWithinAllowPaths,
+    )
+
+    for (const protectedRoot of protectedRoots) {
+      if (!fs.existsSync(protectedRoot)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent allow_only root: ${protectedRoot}`,
+        )
+        continue
+      }
+
+      args.push('--tmpfs', protectedRoot)
+      logForDebugging(
+        `[Sandbox Linux] Masked read root for allow_only mode: ${protectedRoot}`,
+      )
+    }
+
+    for (const allowPath of readAllowOnlyPaths) {
+      if (!fs.existsSync(allowPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent allow_only read path: ${allowPath}`,
+        )
+        continue
+      }
+
+      args.push('--ro-bind', allowPath, allowPath)
+      logForDebugging(
+        `[Sandbox Linux] Allowed read path in allow_only mode: ${allowPath}`,
+      )
+    }
+
+    for (const denyPath of readDenyWithinAllowPaths) {
+      if (!fs.existsSync(denyPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent denyWithinAllow path: ${denyPath}`,
+        )
+        continue
+      }
+
+      const denyStat = fs.statSync(denyPath)
+      if (denyStat.isDirectory()) {
+        args.push('--tmpfs', denyPath)
+      } else {
+        args.push('--ro-bind', '/dev/null', denyPath)
+      }
+
+      logForDebugging(
+        `[Sandbox Linux] Denied read path within allow_only scope: ${denyPath}`,
+      )
+    }
+
+    return args
   }
 
   for (const pathPattern of readDenyPaths) {
@@ -962,7 +1089,7 @@ export async function wrapCommandWithSandboxLinux(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions = hasFsReadRestrictions(readConfig)
   const hasWriteRestrictions = writeConfig !== undefined
 
   // Check if we need any sandboxing

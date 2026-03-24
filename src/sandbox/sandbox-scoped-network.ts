@@ -5,6 +5,7 @@ import type { SocksProxyWrapper } from './socks-proxy.js'
 import type { SandboxRuntimeConfig } from './sandbox-config.js'
 import type { SandboxNetworkBlockEvent } from './sandbox-network-event-store.js'
 import { logForDebugging } from '../utils/debug.js'
+import { getNetworkRestrictionMode } from './sandbox-schemas.js'
 
 export interface ScopedNetworkProxyContext {
   httpProxyPort: number
@@ -25,7 +26,7 @@ export async function createScopedNetworkProxyContext(
       blockedEvents.push({
         host,
         port,
-        detail: 'blocked-by-allowlist',
+        detail: getBlockedEventDetail(runtimeConfig),
         timestamp: new Date(),
       })
     },
@@ -39,7 +40,7 @@ export async function createScopedNetworkProxyContext(
       blockedEvents.push({
         host,
         port,
-        detail: 'blocked-by-allowlist',
+        detail: getBlockedEventDetail(runtimeConfig),
         timestamp: new Date(),
       })
     },
@@ -76,11 +77,20 @@ async function filterNetworkRequest(
   port: number,
   host: string,
 ): Promise<boolean> {
+  const networkMode = getNetworkRestrictionMode({
+    mode: runtimeConfig.network.mode,
+  })
+
   for (const deniedDomain of runtimeConfig.network.deniedDomains) {
     if (matchesDomainPattern(host, deniedDomain)) {
       logForDebugging(`Denied by scoped config rule: ${host}:${port}`)
       return false
     }
+  }
+
+  if (networkMode === 'deny_only') {
+    logForDebugging(`Allowed by scoped deny_only config: ${host}:${port}`)
+    return true
   }
 
   for (const allowedDomain of runtimeConfig.network.allowedDomains) {
@@ -92,6 +102,12 @@ async function filterNetworkRequest(
 
   logForDebugging(`No scoped config rule matched: ${host}:${port}`)
   return false
+}
+
+function getBlockedEventDetail(runtimeConfig: SandboxRuntimeConfig): string {
+  return (runtimeConfig.network.mode ?? 'allow_only') === 'deny_only'
+    ? 'blocked-by-denylist'
+    : 'blocked-by-allowlist'
 }
 
 function getMitmSocketPath(

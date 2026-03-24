@@ -14,11 +14,17 @@ function createTestDir() {
   return mkdtempSync(join(tmpdir(), 'srt-node-runtime-'))
 }
 
-function createConfig(testDir, allowedDomains = ['example.com']) {
+function createConfig(
+  testDir,
+  allowedDomains = ['example.com'],
+  deniedDomains = [],
+  mode,
+) {
   return {
     network: {
+      ...(mode !== undefined ? { mode } : {}),
       allowedDomains,
-      deniedDomains: [],
+      deniedDomains,
     },
     filesystem: {
       denyRead: [],
@@ -145,6 +151,41 @@ test('executeSandboxedCommand returns success when the shell handles a blocked n
   }
 })
 
+test('executeSandboxedCommand throws a deny_only network permission error on macOS', async () => {
+  if (process.platform !== 'darwin') {
+    return
+  }
+
+  const testDir = createTestDir()
+  mkdirSync(join(testDir, 'allow'), { recursive: true })
+
+  try {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(
+      createConfig(testDir, [], ['example.com'], 'deny_only'),
+      undefined,
+      true,
+    )
+
+    const error = await executeSandboxedCommand(
+      createProxyConnectCommand(testDir, 'example.com'),
+    ).catch(error => error)
+
+    assert.equal(isSandboxPermissionError(error), true)
+    assert.equal(error.issues.length, 1)
+    assert.deepEqual(error.issues[0], {
+      kind: 'network',
+      host: 'example.com',
+      port: 443,
+      detail: 'blocked-by-denylist',
+      raw: 'example.com:443',
+    })
+  } finally {
+    await SandboxManager.reset()
+    rmSync(testDir, { recursive: true, force: true })
+  }
+})
+
 test('SandboxManager.updateConfig allow then block domain via proxy', async () => {
   try {
     await SandboxManager.reset()
@@ -192,6 +233,31 @@ test('SandboxManager.updateConfig block then allow domain via proxy', async () =
 
     const allowed = await proxyRequest(proxyPort, 'example.com')
     assert.equal(allowed.allowed, true)
+  } finally {
+    await SandboxManager.reset()
+  }
+})
+
+test('SandboxManager deny_only mode allows by default and blocks explicit denies via proxy', async () => {
+  try {
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        mode: 'deny_only',
+        allowedDomains: [],
+        deniedDomains: ['blocked.example.com'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+
+    const proxyPort = SandboxManager.getProxyPort()
+    assert.ok(proxyPort)
+
+    const allowed = await proxyRequest(proxyPort, 'example.com')
+    assert.equal(allowed.allowed, true)
+
+    const blocked = await proxyRequest(proxyPort, 'blocked.example.com')
+    assert.equal(blocked.allowed, false)
   } finally {
     await SandboxManager.reset()
   }

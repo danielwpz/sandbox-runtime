@@ -164,6 +164,21 @@ describe('SandboxManager.updateConfig', () => {
     expect(fullConfig).toBeDefined()
     expect(fullConfig?.network.allowedDomains).toEqual([])
   })
+
+  it('should expose deny_only network mode in the internal config getter', async () => {
+    await SandboxManager.initialize({
+      network: {
+        mode: 'deny_only',
+        allowedDomains: [],
+        deniedDomains: ['example.com'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+
+    const config = SandboxManager.getNetworkRestrictionConfig()
+    expect(config.mode).toBe('deny_only')
+    expect(config.deniedHosts).toContain('example.com')
+  })
 })
 
 describeNodeRuntimeOnly('SandboxManager.updateConfig proxy filtering', () => {
@@ -219,6 +234,26 @@ describeNodeRuntimeOnly('SandboxManager.updateConfig proxy filtering', () => {
     // Should now be allowed
     const result2 = await proxyRequest(proxyPort!, 'example.com')
     expect(result2.allowed).toBe(true)
+  })
+
+  it('should allow by default in deny_only mode and block explicit denies', async () => {
+    await SandboxManager.initialize({
+      network: {
+        mode: 'deny_only',
+        allowedDomains: [],
+        deniedDomains: ['blocked.example.com'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+
+    const proxyPort = SandboxManager.getProxyPort()
+    expect(proxyPort).toBeDefined()
+
+    const allowed = await proxyRequest(proxyPort!, 'example.com')
+    expect(allowed.allowed).toBe(true)
+
+    const blocked = await proxyRequest(proxyPort!, 'blocked.example.com')
+    expect(blocked.allowed).toBe(false)
   })
 
   it('should handle moving domain between allow and deny lists', async () => {

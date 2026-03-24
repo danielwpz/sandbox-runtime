@@ -1,19 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import {
-  existsSync,
-  mkdirSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
-import type {
-  FsReadRestrictionConfig,
-} from '../../src/sandbox/sandbox-schemas.js'
+import type { FsReadRestrictionConfig } from '../../src/sandbox/sandbox-schemas.js'
 
 function skipIfNotMacOS(): boolean {
   return getPlatform() !== 'macos'
@@ -256,5 +249,149 @@ describe('allowRead without denyRead does not trigger sandboxing', () => {
     })
 
     expect(result).toBe(command)
+  })
+})
+
+describe('readMode allow_only', () => {
+  const TEST_BASE_DIR = join(tmpdir(), 'allow-only-read-test-' + Date.now())
+  const TEST_ALLOWED_DIR = join(TEST_BASE_DIR, 'allowed')
+  const TEST_BLOCKED_DIR = join(TEST_BASE_DIR, 'blocked')
+  const TEST_BLOCKED_NESTED = join(TEST_ALLOWED_DIR, 'blocked')
+  const TEST_ALLOWED_FILE = join(TEST_ALLOWED_DIR, 'visible.txt')
+  const TEST_BLOCKED_FILE = join(TEST_BLOCKED_DIR, 'secret.txt')
+  const TEST_BLOCKED_NESTED_FILE = join(
+    TEST_BLOCKED_NESTED,
+    'nested-secret.txt',
+  )
+
+  beforeAll(() => {
+    if (getPlatform() !== 'macos' && getPlatform() !== 'linux') {
+      return
+    }
+
+    mkdirSync(TEST_ALLOWED_DIR, { recursive: true })
+    mkdirSync(TEST_BLOCKED_DIR, { recursive: true })
+    mkdirSync(TEST_BLOCKED_NESTED, { recursive: true })
+    writeFileSync(TEST_ALLOWED_FILE, 'VISIBLE_ALLOW_ONLY')
+    writeFileSync(TEST_BLOCKED_FILE, 'BLOCKED_ALLOW_ONLY')
+    writeFileSync(TEST_BLOCKED_NESTED_FILE, 'BLOCKED_IN_ALLOWED_SCOPE')
+  })
+
+  afterAll(() => {
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  it('allows only explicit read paths on macOS', () => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    const readConfig: FsReadRestrictionConfig = {
+      mode: 'allow_only',
+      denyOnly: [],
+      allowOnly: [TEST_ALLOWED_DIR],
+      denyWithinAllow: [TEST_BLOCKED_NESTED],
+    }
+
+    const allowedCommand = wrapCommandWithSandboxMacOS({
+      command: `cat ${TEST_ALLOWED_FILE}`,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+    const allowedResult = spawnSync(allowedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(allowedResult.status).toBe(0)
+    expect(allowedResult.stdout).toContain('VISIBLE_ALLOW_ONLY')
+
+    const blockedCommand = wrapCommandWithSandboxMacOS({
+      command: `cat ${TEST_BLOCKED_FILE}`,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+    const blockedResult = spawnSync(blockedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(blockedResult.status).not.toBe(0)
+
+    const deniedWithinAllowCommand = wrapCommandWithSandboxMacOS({
+      command: `cat ${TEST_BLOCKED_NESTED_FILE}`,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+    const deniedWithinAllowResult = spawnSync(deniedWithinAllowCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(deniedWithinAllowResult.status).not.toBe(0)
+  })
+
+  it('allows only explicit read paths on Linux', async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+
+    const readConfig: FsReadRestrictionConfig = {
+      mode: 'allow_only',
+      denyOnly: [],
+      allowOnly: [TEST_ALLOWED_DIR],
+      denyWithinAllow: [TEST_BLOCKED_NESTED],
+    }
+
+    const allowedCommand = await wrapCommandWithSandboxLinux({
+      command: `cat ${TEST_ALLOWED_FILE}`,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+    const allowedResult = spawnSync(allowedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(allowedResult.status).toBe(0)
+    expect(allowedResult.stdout).toContain('VISIBLE_ALLOW_ONLY')
+
+    const blockedCommand = await wrapCommandWithSandboxLinux({
+      command: `cat ${TEST_BLOCKED_FILE}`,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+    const blockedResult = spawnSync(blockedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(blockedResult.status).not.toBe(0)
+
+    const deniedWithinAllowCommand = await wrapCommandWithSandboxLinux({
+      command: `cat ${TEST_BLOCKED_NESTED_FILE}`,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+    const deniedWithinAllowResult = spawnSync(deniedWithinAllowCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(deniedWithinAllowResult.status).not.toBe(0)
   })
 })

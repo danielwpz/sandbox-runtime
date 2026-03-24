@@ -90,6 +90,7 @@ describe('Config Validation', () => {
   test('should validate config with optional fields', () => {
     const config = {
       network: {
+        mode: 'deny_only',
         allowedDomains: ['example.com'],
         deniedDomains: [],
         allowUnixSockets: ['/var/run/docker.sock'],
@@ -97,6 +98,7 @@ describe('Config Validation', () => {
         allowLocalBinding: true,
       },
       filesystem: {
+        readMode: 'allow_only',
         denyRead: ['/etc/shadow'],
         allowWrite: ['/tmp'],
         denyWrite: ['/etc'],
@@ -111,6 +113,25 @@ describe('Config Validation', () => {
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+  })
+
+  test('should reject invalid policy modes', () => {
+    const config = {
+      network: {
+        mode: 'wrong_mode',
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        readMode: 'wrong_mode',
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(false)
   })
 
   test('should reject missing required fields', () => {

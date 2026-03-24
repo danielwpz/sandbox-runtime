@@ -16,7 +16,7 @@
     "postbuild": "[ -d vendor ] && cp -r vendor dist/ || true",
     "build:seccomp": "scripts/build-seccomp-binaries.sh",
     "clean": "rm -rf dist",
-    "test": "bun test",
+    "test": "bun test test/**/*.test.ts",
     "test:node-runtime": "npm run build && node --test test/node-runtime/**/*.test.mjs",
     "test:unit": "bun test test/config-validation.test.ts test/sandbox/seccomp-filter.test.ts",
     "test:integration": "bun test test/sandbox/integration.test.ts",

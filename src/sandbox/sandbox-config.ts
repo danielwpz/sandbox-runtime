@@ -73,6 +73,14 @@ const MitmProxyConfigSchema = z.object({
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
+  mode: z
+    .enum(['allow_only', 'deny_only'])
+    .optional()
+    .describe(
+      'Network policy mode. Omit to keep legacy allowlist behavior. ' +
+        '"allow_only" = only allowedDomains may connect. ' +
+        '"deny_only" = deny deniedDomains and allow everything else.',
+    ),
   allowedDomains: z
     .array(domainPatternSchema)
     .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),
@@ -122,6 +130,14 @@ export const NetworkConfigSchema = z.object({
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
+  readMode: z
+    .enum(['deny_only', 'allow_only'])
+    .optional()
+    .describe(
+      'Read policy mode. Omit to keep legacy denyRead + allowRead semantics. ' +
+        '"deny_only" = deny denyRead and re-allow allowRead. ' +
+        '"allow_only" = allow only allowRead, with denyRead blocking paths inside allowed regions.',
+    ),
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)

@@ -18,6 +18,10 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
+import {
+  getFsReadRestrictionMode,
+  hasFsReadRestrictions,
+} from './sandbox-schemas.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
@@ -112,6 +116,64 @@ function getAncestorDirectories(pathStr: string): string[] {
   }
 
   return ancestors
+}
+
+function deriveAllowOnlyReadRoot(pathStr: string): string {
+  const normalizedPath = normalizePathForSandbox(pathStr)
+  const homePath = process.env.HOME
+    ? normalizePathForSandbox(process.env.HOME)
+    : undefined
+  const cwdPath = normalizePathForSandbox(process.cwd())
+
+  if (
+    homePath &&
+    (normalizedPath === homePath ||
+      normalizedPath.startsWith(homePath + path.sep))
+  ) {
+    return homePath
+  }
+
+  if (
+    normalizedPath === cwdPath ||
+    normalizedPath.startsWith(cwdPath + path.sep)
+  ) {
+    return cwdPath
+  }
+
+  const segments = normalizedPath.split(path.sep).filter(Boolean)
+  if (segments.length === 0) {
+    return path.sep
+  }
+
+  if (segments[0] === 'Users' || segments[0] === 'home') {
+    return path.join(path.sep, segments[0], segments[1] ?? '')
+  }
+
+  if (segments[0] === 'private' && segments[1] === 'var') {
+    return path.join(path.sep, 'private', 'var')
+  }
+
+  return path.join(path.sep, segments[0])
+}
+
+function getAllowOnlyReadRoots(
+  allowPaths: string[],
+  denyPaths: string[],
+): string[] {
+  const roots = new Set<string>()
+
+  for (const pathStr of [...allowPaths, ...denyPaths]) {
+    roots.add(deriveAllowOnlyReadRoot(pathStr))
+  }
+
+  if (roots.size === 0) {
+    if (process.env.HOME) {
+      roots.add(normalizePathForSandbox(process.env.HOME))
+    }
+    roots.add(normalizePathForSandbox(process.cwd()))
+  }
+
+  return [...roots].filter(root => root !== path.sep)
 }
 
 /**
@@ -213,6 +275,72 @@ function generateReadRules(
   }
 
   const rules: string[] = []
+
+  if (getFsReadRestrictionMode(config) === 'allow_only') {
+    const protectedRoots = getAllowOnlyReadRoots(
+      config.allowOnly || [],
+      config.denyWithinAllow || [],
+    )
+
+    rules.push(`(allow file-read*)`)
+
+    for (const pathPattern of protectedRoots) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      rules.push(
+        `(deny file-read*`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
+    }
+
+    for (const pathPattern of config.allowOnly || []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      if (containsGlobChars(normalizedPath)) {
+        const regexPattern = globToRegex(normalizedPath)
+        rules.push(
+          `(allow file-read*`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      } else {
+        rules.push(
+          `(allow file-read*`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
+    }
+
+    for (const pathPattern of config.denyWithinAllow || []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      if (containsGlobChars(normalizedPath)) {
+        const regexPattern = globToRegex(normalizedPath)
+        rules.push(
+          `(deny file-read*`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      } else {
+        rules.push(
+          `(deny file-read*`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
+    }
+
+    rules.push(
+      ...generateMoveBlockingRules(
+        [...protectedRoots, ...(config.denyWithinAllow || [])],
+        logTag,
+      ),
+    )
+
+    return rules
+  }
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
@@ -662,7 +790,7 @@ export function wrapCommandWithSandboxMacOS(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions = hasFsReadRestrictions(readConfig)
   const hasWriteRestrictions = writeConfig !== undefined
 
   // No sandboxing needed
@@ -717,11 +845,7 @@ export function wrapCommandWithSandboxMacOS(
 
   logForDebugging(
     `[Sandbox macOS] Applied restrictions - network: ${!!(httpProxyPort || socksProxyPort)}, read: ${
-      readConfig
-        ? 'allowAllExcept' in readConfig
-          ? 'allowAllExcept'
-          : 'denyAllExcept'
-        : 'none'
+      readConfig ? getFsReadRestrictionMode(readConfig) : 'none'
     }, write: ${
       writeConfig
         ? 'allowAllExcept' in writeConfig
