@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import type { SandboxRuntimeConfig } from './sandbox-config.js'
 import type { SandboxViolationEvent } from './macos-sandbox-utils.js'
 import { SandboxManager } from './sandbox-manager.js'
@@ -95,16 +95,44 @@ async function runWrappedCommand(
   options: SandboxExecOptions,
 ): Promise<SandboxExecResult> {
   return new Promise((resolve, reject) => {
+    if (options.abortSignal?.aborted) {
+      reject(createAbortError())
+      return
+    }
+
     const child = spawn(wrappedCommand, {
       shell: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
       ...(options.cwd ? { cwd: options.cwd } : {}),
       ...(options.env ? { env: options.env } : {}),
-      ...(options.abortSignal ? { signal: options.abortSignal } : {}),
     })
 
     let stdout = ''
     let stderr = ''
+    let settled = false
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (options.abortSignal) {
+        options.abortSignal.removeEventListener('abort', onAbort)
+      }
+      callback()
+    }
+
+    const onAbort = () => {
+      killCommandTree(child)
+      finish(() => {
+        reject(createAbortError())
+      })
+    }
+
+    if (options.abortSignal) {
+      options.abortSignal.addEventListener('abort', onAbort, { once: true })
+    }
 
     child.stdout.on('data', chunk => {
       stdout += chunk.toString()
@@ -112,15 +140,63 @@ async function runWrappedCommand(
     child.stderr.on('data', chunk => {
       stderr += chunk.toString()
     })
-    child.on('error', reject)
-    child.on('close', (code, signal) => {
-      resolve({
-        stdout,
-        stderr,
-        exitCode: code,
-        signal,
+    child.on('error', error => {
+      finish(() => {
+        reject(error)
       })
     })
+    child.on('close', (code, signal) => {
+      finish(() => {
+        resolve({
+          stdout,
+          stderr,
+          exitCode: code,
+          signal,
+        })
+      })
+    })
+  })
+}
+
+function killCommandTree(child: ChildProcess): void {
+  if (child.pid === undefined || child.pid === null) {
+    return
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const killer = spawn(
+        'taskkill',
+        ['/F', '/T', '/PID', String(child.pid)],
+        {
+          stdio: 'ignore',
+          detached: true,
+        },
+      )
+      killer.unref()
+      return
+    } catch {
+      // Fall back to killing the immediate process.
+    }
+  } else {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch {
+      // Fall back to killing the immediate process.
+    }
+  }
+
+  try {
+    child.kill('SIGKILL')
+  } catch {
+    // Ignore already-dead processes.
+  }
+}
+
+function createAbortError(): Error {
+  return Object.assign(new Error('The operation was aborted'), {
+    name: 'AbortError',
   })
 }
 

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
@@ -94,6 +94,12 @@ function proxyRequest(proxyPort, targetHost) {
       socket.destroy()
       resolve({ allowed: false, response: 'timeout' })
     })
+  })
+}
+
+function sleep(ms) {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms)
   })
 }
 
@@ -260,5 +266,41 @@ test('SandboxManager deny_only mode allows by default and blocks explicit denies
     assert.equal(blocked.allowed, false)
   } finally {
     await SandboxManager.reset()
+  }
+})
+
+test('executeSandboxedCommand abort kills the shell process group', async () => {
+  const testDir = createTestDir()
+  const allowDir = join(testDir, 'allow')
+  const heartbeatPath = join(allowDir, 'heartbeat.log')
+  mkdirSync(allowDir, { recursive: true })
+
+  try {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createConfig(testDir), undefined, true)
+
+    const controller = new AbortController()
+    const command = `(while true; do echo tick >> '${heartbeatPath}'; sleep 0.05; done) & child=$!; wait "$child"`
+    const runPromise = executeSandboxedCommand(command, {
+      abortSignal: controller.signal,
+    }).catch(error => error)
+
+    await sleep(200)
+    const beforeAbort = readFileSync(heartbeatPath, 'utf8').trim().split('\n').length
+    controller.abort()
+    const error = await runPromise
+
+    assert.equal(error instanceof Error, true)
+    assert.equal(error.name, 'AbortError')
+    await sleep(200)
+    const afterAbort = readFileSync(heartbeatPath, 'utf8').trim().split('\n').length
+    await sleep(200)
+    const settled = readFileSync(heartbeatPath, 'utf8').trim().split('\n').length
+
+    assert.ok(beforeAbort >= 1)
+    assert.equal(afterAbort, settled)
+  } finally {
+    await SandboxManager.reset()
+    rmSync(testDir, { recursive: true, force: true })
   }
 })
