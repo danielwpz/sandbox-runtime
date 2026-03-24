@@ -32,6 +32,7 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import type { SandboxNetworkBlockEvent } from './sandbox-network-event-store.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
@@ -52,6 +53,7 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 const sandboxViolationStore = new SandboxViolationStore()
+let networkBlockedEvents: SandboxNetworkBlockEvent[] = []
 
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -163,6 +165,14 @@ async function startHttpProxyServer(
   httpProxyServer = createHttpProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
+    onDeniedRequest: (port: number, host: string) => {
+      networkBlockedEvents.push({
+        host,
+        port,
+        detail: 'blocked-by-allowlist',
+        timestamp: new Date(),
+      })
+    },
     getMitmSocketPath,
   })
 
@@ -196,6 +206,14 @@ async function startSocksProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
+    onDeniedRequest: (port: number, host: string) => {
+      networkBlockedEvents.push({
+        host,
+        port,
+        detail: 'blocked-by-allowlist',
+        timestamp: new Date(),
+      })
+    },
   })
 
   return new Promise<number>((resolve, reject) => {
@@ -605,9 +623,20 @@ async function wrapWithSandbox(
   // 1. updateConfig() can enable network access for already-running processes
   // 2. The proxy blocks all requests when allowlist is empty
   const needsNetworkProxy = hasNetworkConfig
+  const customHttpProxyPort = customConfig?.network?.httpProxyPort
+  const customSocksProxyPort = customConfig?.network?.socksProxyPort
+  const httpProxyPort =
+    customHttpProxyPort ?? (needsNetworkProxy ? getProxyPort() : undefined)
+  const socksProxyPort =
+    customSocksProxyPort ??
+    (needsNetworkProxy ? getSocksProxyPort() : undefined)
 
   // Wait for network initialization only if proxy is actually needed
-  if (needsNetworkProxy) {
+  if (
+    needsNetworkProxy &&
+    customHttpProxyPort === undefined &&
+    customSocksProxyPort === undefined
+  ) {
     await waitForNetworkInitialization()
   }
 
@@ -620,9 +649,8 @@ async function wrapWithSandbox(
       return wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction,
-        // Only pass proxy ports if proxy is running (when there are domains to filter)
-        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
-        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        httpProxyPort,
+        socksProxyPort,
         readConfig,
         writeConfig,
         allowUnixSockets: getAllowUnixSockets(),
@@ -646,12 +674,8 @@ async function wrapWithSandbox(
         socksSocketPath: needsNetworkProxy
           ? getLinuxSocksSocketPath()
           : undefined,
-        httpProxyPort: needsNetworkProxy
-          ? managerContext?.httpProxyPort
-          : undefined,
-        socksProxyPort: needsNetworkProxy
-          ? managerContext?.socksProxyPort
-          : undefined,
+        httpProxyPort,
+        socksProxyPort,
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
@@ -867,6 +891,15 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
+  networkBlockedEvents = []
+}
+
+function getNetworkBlockedEvents(): SandboxNetworkBlockEvent[] {
+  return [...networkBlockedEvents]
+}
+
+function clearNetworkBlockedEvents(): void {
+  networkBlockedEvents = []
 }
 
 function getSandboxViolationStore() {
@@ -970,6 +1003,8 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
+  getNetworkBlockedEvents(): SandboxNetworkBlockEvent[]
+  clearNetworkBlockedEvents(): void
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
@@ -1007,6 +1042,8 @@ export const SandboxManager: ISandboxManager = {
   cleanupAfterCommand,
   reset,
   getSandboxViolationStore,
+  getNetworkBlockedEvents,
+  clearNetworkBlockedEvents,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
   getConfig,

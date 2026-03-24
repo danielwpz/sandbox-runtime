@@ -5,6 +5,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
+import type { IncomingMessage } from 'node:http'
 import { logForDebugging } from '../utils/debug.js'
 
 export interface HttpProxyServerOptions {
@@ -13,6 +14,7 @@ export interface HttpProxyServerOptions {
     host: string,
     socket: Socket | Duplex,
   ): Promise<boolean> | boolean
+  onDeniedRequest?(port: number, host: string): void
 
   /**
    * Optional function to get the MITM proxy socket path for a given host.
@@ -20,6 +22,11 @@ export interface HttpProxyServerOptions {
    * If returns undefined, the request will be handled directly.
    */
   getMitmSocketPath?(host: string): string | undefined
+}
+
+export interface ConnectTarget {
+  hostname: string
+  port: number
 }
 
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
@@ -33,19 +40,21 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     })
 
     try {
-      const [hostname, portStr] = req.url!.split(':')
-      const port = portStr === undefined ? undefined : parseInt(portStr, 10)
+      const connectTarget = parseConnectTarget(req)
 
-      if (!hostname || !port) {
-        logForDebugging(`Invalid CONNECT request: ${req.url}`, {
+      if (!connectTarget) {
+        logForDebugging(`Invalid CONNECT request: url=${req.url ?? ''}`, {
           level: 'error',
         })
         socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
         return
       }
 
+      const { hostname, port } = connectTarget
+
       const allowed = await options.filter(port, hostname, socket)
       if (!allowed) {
+        options.onDeniedRequest?.(port, hostname)
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })
@@ -178,6 +187,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const allowed = await options.filter(port, hostname, req.socket)
       if (!allowed) {
+        options.onDeniedRequest?.(port, hostname)
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
         })
@@ -275,4 +285,65 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   })
 
   return server
+}
+
+export function parseConnectTarget(
+  req: Pick<IncomingMessage, 'url' | 'headers'>,
+): ConnectTarget | null {
+  const hostHeader = req.headers.host
+  const hostHeaderValue = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader
+  const candidates = [req.url, hostHeaderValue]
+
+  for (const candidate of candidates) {
+    const parsed = parseConnectTargetValue(candidate)
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  return null
+}
+
+function parseConnectTargetValue(
+  value: string | undefined,
+): ConnectTarget | null {
+  if (!value) {
+    return null
+  }
+
+  const trimmed = value.trim()
+  if (trimmed === '') {
+    return null
+  }
+
+  let target = trimmed
+  if (/\s/.test(trimmed)) {
+    const requestLineMatch = trimmed.match(/^CONNECT\s+(\S+)\s+HTTP\/\d\.\d$/i)
+    if (!requestLineMatch) {
+      return null
+    }
+    target = requestLineMatch[1]
+  }
+
+  target = target.replace(/^\/+/, '')
+
+  if (target === '') {
+    return null
+  }
+
+  try {
+    const parsed = new URL(
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(target) ? target : `http://${target}`,
+    )
+    const hostname = parsed.hostname
+    const port = parsed.port === '' ? 443 : Number(parsed.port)
+
+    if (!hostname || !Number.isInteger(port) || port <= 0 || port > 65535) {
+      return null
+    }
+
+    return { hostname, port }
+  } catch {
+    return null
+  }
 }
