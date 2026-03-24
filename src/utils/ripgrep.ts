@@ -1,5 +1,4 @@
 import { spawn } from 'child_process'
-import { text } from 'node:stream/consumers'
 import { whichSync } from './which.js'
 
 export interface RipgrepConfig {
@@ -42,8 +41,8 @@ export async function ripGrep(
   })
 
   const [stdout, stderr, code] = await Promise.all([
-    text(child.stdout),
-    text(child.stderr),
+    readStream(child.stdout),
+    readStream(child.stderr),
     new Promise<number | null>((resolve, reject) => {
       child.on('close', resolve)
       child.on('error', reject)
@@ -58,4 +57,24 @@ export async function ripGrep(
     return []
   }
   throw new Error(`ripgrep failed with exit code ${code}: ${stderr}`)
+}
+
+function readStream(
+  stream: NodeJS.ReadableStream | null | undefined,
+): Promise<string> {
+  if (stream === null || stream === undefined) {
+    return Promise.resolve('')
+  }
+
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+
+    stream.on('data', chunk => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+    })
+    stream.on('end', () => {
+      resolve(Buffer.concat(chunks).toString('utf8'))
+    })
+    stream.on('error', reject)
+  })
 }
