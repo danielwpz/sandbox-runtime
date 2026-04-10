@@ -1,4 +1,6 @@
-# Anthropic Sandbox Runtime (srt)
+# Sandbox Runtime (srt) — Pokeclaw fork
+
+A maintained fork of Anthropic Sandbox Runtime published as `@danielwpz/sandbox-runtime`.
 
 A lightweight sandboxing tool for enforcing filesystem and network restrictions on arbitrary processes at the OS level, without requiring a container.
 
@@ -11,7 +13,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g @anthropic-ai/sandbox-runtime
+npm install -g @danielwpz/sandbox-runtime
 ```
 
 ## Basic Usage
@@ -176,7 +178,7 @@ srt --settings /path/to/srt-settings.json npm install
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@danielwpz/sandbox-runtime'
 import { spawn } from 'child_process'
 
 // Define your sandbox configuration
@@ -215,10 +217,10 @@ child.on('exit', async code => {
 
 ```typescript
 // Main sandbox manager
-export { SandboxManager } from '@anthropic-ai/sandbox-runtime'
+export { SandboxManager } from '@danielwpz/sandbox-runtime'
 
 // Violation tracking
-export { SandboxViolationStore } from '@anthropic-ai/sandbox-runtime'
+export { SandboxViolationStore } from '@danielwpz/sandbox-runtime'
 
 // TypeScript types
 export type {
@@ -230,7 +232,7 @@ export type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@danielwpz/sandbox-runtime'
 ```
 
 ## Configuration

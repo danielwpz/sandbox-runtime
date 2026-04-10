@@ -1121,7 +1121,7 @@ export async function wrapCommandWithSandboxLinux(
         // Seccomp binaries not found - warn but continue without unix socket blocking
         logForDebugging(
           '[Sandbox Linux] Seccomp binaries not available - unix socket blocking disabled. ' +
-            'Install @anthropic-ai/sandbox-runtime globally for full protection.',
+            'Install @danielwpz/sandbox-runtime globally for full protection.',
           { level: 'warn' },
         )
         // Clear the filter path so we don't try to use it
