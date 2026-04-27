@@ -137,6 +137,27 @@ describe('wrapWithSandbox customConfig', () => {
 
       expect(wrapped).not.toBe(command)
     })
+
+    it('uses custom allowLocalBinding when provided', async () => {
+      if (getPlatform() !== 'macos') {
+        return
+      }
+
+      const command = 'echo hello'
+      const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
+        network: {
+          mode: 'deny_only',
+          allowedDomains: [],
+          deniedDomains: ['internal.example.com'],
+          allowLocalBinding: true,
+        },
+      })
+      const profile = wrapped.replace(/\\"/g, '"')
+
+      expect(profile).toContain('(allow network-bind (local ip "*:*"))')
+      expect(profile).toContain('(allow network-inbound (local ip "*:*"))')
+      expect(profile).toContain('(allow network-outbound (local ip "*:*"))')
+    })
   })
 
   describe('readonly mode simulation', () => {
