@@ -18,6 +18,11 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
+import {
+  getFsReadRestrictionMode,
+  getFsWriteRestrictionMode,
+  hasFsReadRestrictions,
+} from './sandbox-schemas.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
@@ -93,16 +98,33 @@ function generateLogTag(command: string): string {
 }
 
 /**
- * Get all ancestor directories for a path, up to (but not including) root
- * Example: /private/tmp/test/file.txt -> ["/private/tmp/test", "/private/tmp", "/private"]
+ * Get all ancestor directories for a path, stopping once a boundary directory
+ * has been included. Root itself is never returned.
+ * Example: /private/tmp/test/file.txt with stopPath=/private/tmp ->
+ * ["/private/tmp/test", "/private/tmp"]
  */
-function getAncestorDirectories(pathStr: string): string[] {
+function getAncestorDirectories(pathStr: string, stopPath?: string): string[] {
   const ancestors: string[] = []
+  const normalizedPath = normalizePathForSandbox(pathStr)
   let currentPath = path.dirname(pathStr)
+  const normalizedStopPath = stopPath
+    ? normalizePathForSandbox(stopPath)
+    : undefined
+
+  if (normalizedStopPath && normalizedPath === normalizedStopPath) {
+    return ancestors
+  }
 
   // Walk up the directory tree until we reach root
   while (currentPath !== '/' && currentPath !== '.') {
     ancestors.push(currentPath)
+    if (
+      normalizedStopPath &&
+      normalizePathForSandbox(currentPath) === normalizedStopPath
+    ) {
+      break
+    }
+
     const parentPath = path.dirname(currentPath)
     // Break if we've reached the top (path.dirname returns the same path for root)
     if (parentPath === currentPath) {
@@ -112,6 +134,150 @@ function getAncestorDirectories(pathStr: string): string[] {
   }
 
   return ancestors
+}
+
+function deriveAllowOnlyReadRoot(pathStr: string): string {
+  const normalizedPath = normalizePathForSandbox(pathStr)
+  const homePath = process.env.HOME
+    ? normalizePathForSandbox(process.env.HOME)
+    : undefined
+  const cwdPath = normalizePathForSandbox(process.cwd())
+
+  if (
+    homePath &&
+    (normalizedPath === homePath ||
+      normalizedPath.startsWith(homePath + path.sep))
+  ) {
+    return homePath
+  }
+
+  if (
+    normalizedPath === cwdPath ||
+    normalizedPath.startsWith(cwdPath + path.sep)
+  ) {
+    return cwdPath
+  }
+
+  const segments = normalizedPath.split(path.sep).filter(Boolean)
+  if (segments.length === 0) {
+    return path.sep
+  }
+
+  if (segments[0] === 'Users' || segments[0] === 'home') {
+    return path.join(path.sep, segments[0], segments[1] ?? '')
+  }
+
+  if (segments[0] === 'private' && segments[1] === 'var') {
+    return path.join(path.sep, 'private', 'var')
+  }
+
+  return path.join(path.sep, segments[0])
+}
+
+function getAllowOnlyReadRoots(
+  allowPaths: string[],
+  denyPaths: string[],
+): string[] {
+  const roots = new Set<string>()
+
+  for (const pathStr of [...allowPaths, ...denyPaths]) {
+    roots.add(deriveAllowOnlyReadRoot(pathStr))
+  }
+
+  if (roots.size === 0) {
+    if (process.env.HOME) {
+      roots.add(normalizePathForSandbox(process.env.HOME))
+    }
+    roots.add(normalizePathForSandbox(process.cwd()))
+  }
+
+  return [...roots].filter(root => root !== path.sep)
+}
+
+function getPathPatternBoundary(pathPattern: string): string | undefined {
+  const normalizedPath = normalizePathForSandbox(pathPattern)
+  if (!containsGlobChars(normalizedPath)) {
+    return normalizedPath
+  }
+
+  const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
+  if (!staticPrefix || staticPrefix === '/') {
+    return undefined
+  }
+
+  return staticPrefix.endsWith('/')
+    ? staticPrefix.slice(0, -1)
+    : path.dirname(staticPrefix)
+}
+
+function isPathWithin(basePath: string, candidatePath: string): boolean {
+  return (
+    candidatePath === basePath || candidatePath.startsWith(basePath + path.sep)
+  )
+}
+
+function pathPatternContainsAllowedDescendant(
+  pathPattern: string,
+  allowedPaths: string[],
+): boolean {
+  const pathBoundary = getPathPatternBoundary(pathPattern)
+  if (!pathBoundary) {
+    return false
+  }
+
+  return allowedPaths.some(allowedPath => {
+    const allowedBoundary =
+      getPathPatternBoundary(allowedPath) ??
+      normalizePathForSandbox(allowedPath)
+    return isPathWithin(pathBoundary, allowedBoundary)
+  })
+}
+
+function findNearestContainingStopPath(
+  pathStr: string,
+  stopPaths: string[],
+): string | undefined {
+  const normalizedPath = normalizePathForSandbox(pathStr)
+  const containingPaths = stopPaths
+    .map(stopPath => normalizePathForSandbox(stopPath))
+    .filter(
+      stopPath =>
+        normalizedPath === stopPath ||
+        normalizedPath.startsWith(stopPath + path.sep),
+    )
+    .sort((left, right) => right.length - left.length)
+
+  return containingPaths[0]
+}
+
+function resolveMoveBlockingBoundary(
+  pathStr: string,
+  stopPaths: string[],
+): string {
+  return (
+    findNearestContainingStopPath(pathStr, stopPaths) ??
+    deriveAllowOnlyReadRoot(pathStr)
+  )
+}
+
+function appendMoveBlockingRule(
+  rules: string[],
+  seenRules: Set<string>,
+  matcherType: 'literal' | 'subpath' | 'regex',
+  matcherValue: string,
+  logTag: string,
+): void {
+  const ruleKey = `${matcherType}:${matcherValue}`
+  if (seenRules.has(ruleKey)) {
+    return
+  }
+
+  seenRules.add(ruleKey)
+  rules.push(
+    `(deny file-write-unlink`,
+    `  (${matcherType} ${escapePath(matcherValue)})`,
+    `  (with message "${logTag}"))`,
+  )
 }
 
 /**
@@ -125,8 +291,10 @@ function getAncestorDirectories(pathStr: string): string[] {
 function generateMoveBlockingRules(
   pathPatterns: string[],
   logTag: string,
+  stopPaths: string[] = [],
 ): string[] {
   const rules: string[] = []
+  const seenRules = new Set<string>()
 
   for (const pathPattern of pathPatterns) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
@@ -136,11 +304,7 @@ function generateMoveBlockingRules(
       const regexPattern = globToRegex(normalizedPath)
 
       // Block moving/renaming files matching this pattern
-      rules.push(
-        `(deny file-write-unlink`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
+      appendMoveBlockingRule(rules, seenRules, 'regex', regexPattern, logTag)
 
       // For glob patterns, extract the static prefix and block ancestor moves
       // Remove glob characters to get the directory prefix
@@ -150,20 +314,19 @@ function generateMoveBlockingRules(
         const baseDir = staticPrefix.endsWith('/')
           ? staticPrefix.slice(0, -1)
           : path.dirname(staticPrefix)
+        const boundary = resolveMoveBlockingBoundary(baseDir, stopPaths)
 
         // Block moves of the base directory itself
-        rules.push(
-          `(deny file-write-unlink`,
-          `  (literal ${escapePath(baseDir)})`,
-          `  (with message "${logTag}"))`,
-        )
+        appendMoveBlockingRule(rules, seenRules, 'literal', baseDir, logTag)
 
         // Block moves of ancestor directories
-        for (const ancestorDir of getAncestorDirectories(baseDir)) {
-          rules.push(
-            `(deny file-write-unlink`,
-            `  (literal ${escapePath(ancestorDir)})`,
-            `  (with message "${logTag}"))`,
+        for (const ancestorDir of getAncestorDirectories(baseDir, boundary)) {
+          appendMoveBlockingRule(
+            rules,
+            seenRules,
+            'literal',
+            ancestorDir,
+            logTag,
           )
         }
       }
@@ -171,19 +334,21 @@ function generateMoveBlockingRules(
       // Use subpath matching for literal paths
 
       // Block moving/renaming the denied path itself
-      rules.push(
-        `(deny file-write-unlink`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
+      appendMoveBlockingRule(
+        rules,
+        seenRules,
+        'subpath',
+        normalizedPath,
+        logTag,
       )
+      const boundary = resolveMoveBlockingBoundary(normalizedPath, stopPaths)
 
       // Block moves of ancestor directories
-      for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
-        rules.push(
-          `(deny file-write-unlink`,
-          `  (literal ${escapePath(ancestorDir)})`,
-          `  (with message "${logTag}"))`,
-        )
+      for (const ancestorDir of getAncestorDirectories(
+        normalizedPath,
+        boundary,
+      )) {
+        appendMoveBlockingRule(rules, seenRules, 'literal', ancestorDir, logTag)
       }
     }
   }
@@ -207,12 +372,85 @@ function generateMoveBlockingRules(
 function generateReadRules(
   config: FsReadRestrictionConfig | undefined,
   logTag: string,
+  writableRoots: string[] = [],
 ): string[] {
   if (!config) {
     return [`(allow file-read*)`]
   }
 
   const rules: string[] = []
+
+  if (getFsReadRestrictionMode(config) === 'allow_only') {
+    const protectedRoots = getAllowOnlyReadRoots(
+      config.allowOnly || [],
+      config.denyWithinAllow || [],
+    )
+
+    rules.push(`(allow file-read*)`)
+
+    for (const pathPattern of protectedRoots) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      rules.push(
+        `(deny file-read*`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
+    }
+
+    for (const pathPattern of config.allowOnly || []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      if (containsGlobChars(normalizedPath)) {
+        const regexPattern = globToRegex(normalizedPath)
+        rules.push(
+          `(allow file-read*`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      } else {
+        rules.push(
+          `(allow file-read*`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
+    }
+
+    for (const pathPattern of config.denyWithinAllow || []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      if (containsGlobChars(normalizedPath)) {
+        const regexPattern = globToRegex(normalizedPath)
+        rules.push(
+          `(deny file-read*`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      } else {
+        rules.push(
+          `(deny file-read*`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
+    }
+
+    // On macOS, broad allow_only protected roots (for example "/private/var")
+    // cannot safely be translated into unlink-deny rules without breaking
+    // normal delete/rename operations inside writable subtrees. The security-
+    // critical case is explicit read-denied paths inside otherwise writable
+    // areas, so only generate move-blocking rules for denyWithinAllow.
+    rules.push(
+      ...generateMoveBlockingRules(
+        config.denyWithinAllow || [],
+        logTag,
+        writableRoots,
+      ),
+    )
+
+    return rules
+  }
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
@@ -270,7 +508,17 @@ function generateReadRules(
   }
 
   // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
+  const moveBlockingDenyPaths = (config.denyOnly || []).filter(
+    pathPattern =>
+      !pathPatternContainsAllowedDescendant(
+        pathPattern,
+        config.allowWithinDeny || [],
+      ),
+  )
+
+  rules.push(
+    ...generateMoveBlockingRules(moveBlockingDenyPaths, logTag, writableRoots),
+  )
 
   return rules
 }
@@ -288,26 +536,31 @@ function generateWriteRules(
   }
 
   const rules: string[] = []
+  const writeMode = getFsWriteRestrictionMode(config)
 
-  // Generate allow rules
-  for (const pathPattern of config.allowOnly || []) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
+  if (writeMode === 'deny_only') {
+    rules.push(`(allow file-write*)`)
+  } else {
+    // Generate allow rules
+    for (const pathPattern of config.allowOnly || []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
 
-    if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
-      rules.push(
-        `(allow file-write*`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
-    } else {
-      // Use subpath matching for literal paths
-      rules.push(
-        `(allow file-write*`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
+      if (containsGlobChars(normalizedPath)) {
+        // Use regex matching for glob patterns
+        const regexPattern = globToRegex(normalizedPath)
+        rules.push(
+          `(allow file-write*`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      } else {
+        // Use subpath matching for literal paths
+        rules.push(
+          `(allow file-write*`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
     }
   }
 
@@ -339,7 +592,7 @@ function generateWriteRules(
   }
 
   // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(denyPaths, logTag))
+  rules.push(...generateMoveBlockingRules(denyPaths, logTag, config.allowOnly))
 
   return rules
 }
@@ -605,7 +858,9 @@ function generateSandboxProfile({
 
   // Read rules
   profile.push('; File read')
-  profile.push(...generateReadRules(readConfig, logTag))
+  profile.push(
+    ...generateReadRules(readConfig, logTag, writeConfig?.allowOnly ?? []),
+  )
   profile.push('')
 
   // Write rules
@@ -662,7 +917,7 @@ export function wrapCommandWithSandboxMacOS(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions = hasFsReadRestrictions(readConfig)
   const hasWriteRestrictions = writeConfig !== undefined
 
   // No sandboxing needed
@@ -717,18 +972,8 @@ export function wrapCommandWithSandboxMacOS(
 
   logForDebugging(
     `[Sandbox macOS] Applied restrictions - network: ${!!(httpProxyPort || socksProxyPort)}, read: ${
-      readConfig
-        ? 'allowAllExcept' in readConfig
-          ? 'allowAllExcept'
-          : 'denyAllExcept'
-        : 'none'
-    }, write: ${
-      writeConfig
-        ? 'allowAllExcept' in writeConfig
-          ? 'allowAllExcept'
-          : 'denyAllExcept'
-        : 'none'
-    }`,
+      readConfig ? getFsReadRestrictionMode(readConfig) : 'none'
+    }, write: ${writeConfig ? getFsWriteRestrictionMode(writeConfig) : 'none'}`,
   )
 
   return wrappedCommand

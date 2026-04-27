@@ -1,6 +1,17 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
+export {
+  executeSandboxedCommand,
+  type SandboxExecOptions,
+  type SandboxExecResult,
+} from './sandbox/sandbox-exec.js'
+export {
+  SandboxPermissionError,
+  isSandboxPermissionError,
+  type SandboxPermissionIssue,
+} from './sandbox/sandbox-permission-error.js'
+export type { SandboxNetworkBlockEvent } from './sandbox/sandbox-network-event-store.js'
 
 // Configuration types and schemas
 export type {

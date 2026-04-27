@@ -21,6 +21,11 @@ import type {
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
+  getFsReadRestrictionMode,
+  getFsWriteRestrictionMode,
+  hasFsReadRestrictions,
+} from './sandbox-schemas.js'
+import {
   generateSeccompFilter,
   cleanupSeccompFilter,
   getPreGeneratedBpfPath,
@@ -84,9 +89,8 @@ function findSymlinkInPath(
       const stats = fs.lstatSync(nextPath)
       if (stats.isSymbolicLink()) {
         // Check if this symlink is within an allowed write path
-        const isWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            nextPath.startsWith(allowedPath + '/') || nextPath === allowedPath,
+        const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+          isSameOrWithinPath(allowedPath, nextPath),
         )
         if (isWithinAllowedPath) {
           return nextPath
@@ -100,6 +104,17 @@ function findSymlinkInPath(
   }
 
   return null
+}
+
+function isSameOrWithinPath(basePath: string, candidatePath: string): boolean {
+  const normalizedBase = normalizePathForSandbox(basePath)
+  const normalizedCandidate = normalizePathForSandbox(candidatePath)
+
+  return (
+    normalizedBase === '/' ||
+    normalizedCandidate === normalizedBase ||
+    normalizedCandidate.startsWith(normalizedBase + '/')
+  )
 }
 
 /**
@@ -154,6 +169,65 @@ function findFirstNonExistentComponent(targetPath: string): string {
   }
 
   return targetPath // Shouldn't reach here if called correctly
+}
+
+function deriveAllowOnlyReadRoot(targetPath: string): string {
+  const normalizedPath = normalizePathForSandbox(targetPath)
+  const homePath = process.env.HOME
+    ? normalizePathForSandbox(process.env.HOME)
+    : undefined
+  const cwdPath = normalizePathForSandbox(process.cwd())
+
+  if (homePath) {
+    if (
+      normalizedPath === homePath ||
+      normalizedPath.startsWith(homePath + path.sep)
+    ) {
+      return homePath
+    }
+  }
+
+  if (
+    normalizedPath === cwdPath ||
+    normalizedPath.startsWith(cwdPath + path.sep)
+  ) {
+    return cwdPath
+  }
+
+  const segments = normalizedPath.split(path.sep).filter(Boolean)
+  if (segments.length === 0) {
+    return path.sep
+  }
+
+  if (segments[0] === 'home' || segments[0] === 'Users') {
+    return path.join(path.sep, segments[0], segments[1] ?? '')
+  }
+
+  if (segments[0] === 'var' && segments[1] === 'tmp') {
+    return path.join(path.sep, 'var', 'tmp')
+  }
+
+  return path.join(path.sep, segments[0])
+}
+
+function getAllowOnlyReadRoots(
+  allowPaths: string[],
+  denyPaths: string[],
+): string[] {
+  const roots = new Set<string>()
+
+  for (const pathStr of [...allowPaths, ...denyPaths]) {
+    roots.add(deriveAllowOnlyReadRoot(pathStr))
+  }
+
+  if (roots.size === 0) {
+    if (process.env.HOME) {
+      roots.add(normalizePathForSandbox(process.env.HOME))
+    }
+    roots.add(normalizePathForSandbox(process.cwd()))
+  }
+
+  return [...roots].filter(root => root !== path.sep)
 }
 
 /**
@@ -646,61 +720,71 @@ async function generateFilesystemArgs(
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
-    // Write restrictions: Start with read-only root, then allow writes to specific paths
-    args.push('--ro-bind', '/', '/')
-
-    // Collect normalized allowed write paths for later checking
+    const writeMode = getFsWriteRestrictionMode(writeConfig)
     const allowedWritePaths: string[] = []
 
-    // Allow writes to specific paths
-    for (const pathPattern of writeConfig.allowOnly || []) {
-      const normalizedPath = normalizePathForSandbox(pathPattern)
+    if (writeMode === 'deny_only') {
+      // Deny-only writes keep the host filesystem writable by default, then
+      // mount denied paths back as read-only or masked entries below.
+      args.push('--bind', '/', '/')
+      allowedWritePaths.push('/')
+    } else {
+      // Allow-only writes start with read-only root, then allow writes to
+      // specific paths.
+      args.push('--ro-bind', '/', '/')
 
-      logForDebugging(
-        `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
-      )
+      // Allow writes to specific paths
+      for (const pathPattern of writeConfig.allowOnly || []) {
+        const normalizedPath = normalizePathForSandbox(pathPattern)
 
-      // Skip /dev/* paths since --dev /dev already handles them
-      if (normalizedPath.startsWith('/dev/')) {
-        logForDebugging(`[Sandbox Linux] Skipping /dev path: ${normalizedPath}`)
-        continue
-      }
-
-      if (!fs.existsSync(normalizedPath)) {
         logForDebugging(
-          `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+          `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
         )
-        continue
-      }
 
-      // Check if path is a symlink pointing outside expected boundaries
-      // bwrap follows symlinks, so --bind on a symlink makes the target writable
-      // This could unexpectedly expose paths the user didn't intend to allow
-      try {
-        const resolvedPath = fs.realpathSync(normalizedPath)
-        // Trim trailing slashes before comparing: realpathSync never returns
-        // a trailing slash, but normalizedPath may have one, which would cause
-        // a false mismatch and incorrectly treat the path as a symlink.
-        const normalizedForComparison = normalizedPath.replace(/\/+$/, '')
-        if (
-          resolvedPath !== normalizedForComparison &&
-          isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
-        ) {
+        // Skip /dev/* paths since --dev /dev already handles them
+        if (normalizedPath.startsWith('/dev/')) {
           logForDebugging(
-            `[Sandbox Linux] Skipping symlink write path pointing outside expected location: ${pathPattern} -> ${resolvedPath}`,
+            `[Sandbox Linux] Skipping /dev path: ${normalizedPath}`,
           )
           continue
         }
-      } catch {
-        // realpathSync failed - path might not exist or be accessible, skip it
-        logForDebugging(
-          `[Sandbox Linux] Skipping write path that could not be resolved: ${normalizedPath}`,
-        )
-        continue
-      }
 
-      args.push('--bind', normalizedPath, normalizedPath)
-      allowedWritePaths.push(normalizedPath)
+        if (!fs.existsSync(normalizedPath)) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+          )
+          continue
+        }
+
+        // Check if path is a symlink pointing outside expected boundaries
+        // bwrap follows symlinks, so --bind on a symlink makes the target writable
+        // This could unexpectedly expose paths the user didn't intend to allow
+        try {
+          const resolvedPath = fs.realpathSync(normalizedPath)
+          // Trim trailing slashes before comparing: realpathSync never returns
+          // a trailing slash, but normalizedPath may have one, which would cause
+          // a false mismatch and incorrectly treat the path as a symlink.
+          const normalizedForComparison = normalizedPath.replace(/\/+$/, '')
+          if (
+            resolvedPath !== normalizedForComparison &&
+            isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
+          ) {
+            logForDebugging(
+              `[Sandbox Linux] Skipping symlink write path pointing outside expected location: ${pathPattern} -> ${resolvedPath}`,
+            )
+            continue
+          }
+        } catch {
+          // realpathSync failed - path might not exist or be accessible, skip it
+          logForDebugging(
+            `[Sandbox Linux] Skipping write path that could not be resolved: ${normalizedPath}`,
+          )
+          continue
+        }
+
+        args.push('--bind', normalizedPath, normalizedPath)
+        allowedWritePaths.push(normalizedPath)
+      }
     }
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
@@ -764,9 +848,8 @@ async function generateFilesystemArgs(
         // If not, the path is already read-only from --ro-bind / /.
         const ancestorIsWithinAllowedPath = allowedWritePaths.some(
           allowedPath =>
-            ancestorPath.startsWith(allowedPath + '/') ||
-            ancestorPath === allowedPath ||
-            normalizedPath.startsWith(allowedPath + '/'),
+            isSameOrWithinPath(allowedPath, ancestorPath) ||
+            isSameOrWithinPath(allowedPath, normalizedPath),
         )
 
         if (ancestorIsWithinAllowedPath) {
@@ -804,10 +887,8 @@ async function generateFilesystemArgs(
 
       // Only add deny binding if this path is within an allowed write path
       // Otherwise it's already read-only from the initial --ro-bind / /
-      const isWithinAllowedPath = allowedWritePaths.some(
-        allowedPath =>
-          normalizedPath.startsWith(allowedPath + '/') ||
-          normalizedPath === allowedPath,
+      const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+        isSameOrWithinPath(allowedPath, normalizedPath),
       )
 
       if (isWithinAllowedPath) {
@@ -824,8 +905,15 @@ async function generateFilesystemArgs(
   }
 
   // Handle read restrictions by mounting tmpfs over denied paths
+  const readMode = getFsReadRestrictionMode(readConfig)
   const readDenyPaths = [...(readConfig?.denyOnly || [])]
   const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
+    normalizePathForSandbox(p),
+  )
+  const readAllowOnlyPaths = (readConfig?.allowOnly || []).map(p =>
+    normalizePathForSandbox(p),
+  )
+  const readDenyWithinAllowPaths = (readConfig?.denyWithinAllow || []).map(p =>
     normalizePathForSandbox(p),
   )
 
@@ -834,6 +922,63 @@ async function generateFilesystemArgs(
   // appear wrong inside the sandbox causing "Bad owner or permissions" errors
   if (fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')
+  }
+
+  if (readMode === 'allow_only') {
+    const protectedRoots = getAllowOnlyReadRoots(
+      readAllowOnlyPaths,
+      readDenyWithinAllowPaths,
+    )
+
+    for (const protectedRoot of protectedRoots) {
+      if (!fs.existsSync(protectedRoot)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent allow_only root: ${protectedRoot}`,
+        )
+        continue
+      }
+
+      args.push('--tmpfs', protectedRoot)
+      logForDebugging(
+        `[Sandbox Linux] Masked read root for allow_only mode: ${protectedRoot}`,
+      )
+    }
+
+    for (const allowPath of readAllowOnlyPaths) {
+      if (!fs.existsSync(allowPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent allow_only read path: ${allowPath}`,
+        )
+        continue
+      }
+
+      args.push('--ro-bind', allowPath, allowPath)
+      logForDebugging(
+        `[Sandbox Linux] Allowed read path in allow_only mode: ${allowPath}`,
+      )
+    }
+
+    for (const denyPath of readDenyWithinAllowPaths) {
+      if (!fs.existsSync(denyPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent denyWithinAllow path: ${denyPath}`,
+        )
+        continue
+      }
+
+      const denyStat = fs.statSync(denyPath)
+      if (denyStat.isDirectory()) {
+        args.push('--tmpfs', denyPath)
+      } else {
+        args.push('--ro-bind', '/dev/null', denyPath)
+      }
+
+      logForDebugging(
+        `[Sandbox Linux] Denied read path within allow_only scope: ${denyPath}`,
+      )
+    }
+
+    return args
   }
 
   for (const pathPattern of readDenyPaths) {
@@ -962,7 +1107,7 @@ export async function wrapCommandWithSandboxLinux(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions = hasFsReadRestrictions(readConfig)
   const hasWriteRestrictions = writeConfig !== undefined
 
   // Check if we need any sandboxing
@@ -994,7 +1139,7 @@ export async function wrapCommandWithSandboxLinux(
         // Seccomp binaries not found - warn but continue without unix socket blocking
         logForDebugging(
           '[Sandbox Linux] Seccomp binaries not available - unix socket blocking disabled. ' +
-            'Install @anthropic-ai/sandbox-runtime globally for full protection.',
+            'Install @danielwpz/sandbox-runtime globally for full protection.',
           { level: 'warn' },
         )
         // Clear the filter path so we don't try to use it

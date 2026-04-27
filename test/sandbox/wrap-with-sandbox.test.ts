@@ -322,6 +322,46 @@ describe('restriction pattern semantics', () => {
       expect(result).not.toBe(command)
       expect(result).toContain('bwrap')
     })
+
+    it('allow_only read mode means has read restrictions on Linux', async () => {
+      if (getPlatform() !== 'linux') {
+        return
+      }
+
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          mode: 'allow_only',
+          denyOnly: [],
+          allowOnly: ['/tmp'],
+        },
+        writeConfig: undefined,
+      })
+
+      expect(result).not.toBe(command)
+      expect(result).toContain('bwrap')
+    })
+
+    it('allow_only read mode means has read restrictions on macOS', () => {
+      if (getPlatform() !== 'macos') {
+        return
+      }
+
+      const result = wrapCommandWithSandboxMacOS({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          mode: 'allow_only',
+          denyOnly: [],
+          allowOnly: ['/tmp'],
+        },
+        writeConfig: undefined,
+      })
+
+      expect(result).not.toBe(command)
+      expect(result).toContain('sandbox-exec')
+    })
   })
 
   describe('write restrictions (allow-only pattern)', () => {
@@ -372,6 +412,48 @@ describe('restriction pattern semantics', () => {
       })
 
       // Should wrap because writeConfig is defined
+      expect(result).not.toBe(command)
+      expect(result).toContain('sandbox-exec')
+    })
+  })
+
+  describe('write restrictions (deny-only pattern)', () => {
+    it('deny_only write mode means has write restrictions on Linux', async () => {
+      if (getPlatform() !== 'linux') {
+        return
+      }
+
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: {
+          mode: 'deny_only',
+          allowOnly: [],
+          denyWithinAllow: ['/tmp/blocked-write'],
+        },
+      })
+
+      expect(result).not.toBe(command)
+      expect(result).toContain('bwrap')
+    })
+
+    it('deny_only write mode means has write restrictions on macOS', () => {
+      if (getPlatform() !== 'macos') {
+        return
+      }
+
+      const result = wrapCommandWithSandboxMacOS({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: {
+          mode: 'deny_only',
+          allowOnly: [],
+          denyWithinAllow: ['/tmp/blocked-write'],
+        },
+      })
+
       expect(result).not.toBe(command)
       expect(result).toContain('sandbox-exec')
     })
@@ -629,8 +711,11 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
 
       // Should still wrap with sandbox
       expect(result).not.toBe(command)
-      // Should have proxy environment variables for filtering
-      expect(result).toContain('HTTP_PROXY')
+      // Proxy runtime behavior is covered by node-runtime tests. Here we only
+      // need to confirm that the command is sandboxed under the network policy.
+      expect(result).toContain(
+        getPlatform() === 'macos' ? 'sandbox-exec' : 'bwrap',
+      )
     })
 
     it('undefined network config in customConfig falls back to main config', async () => {
@@ -649,8 +734,9 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
 
       // Should wrap with sandbox using main config's network settings
       expect(result).not.toBe(command)
-      // Main config has example.com, so proxy should be set up
-      expect(result).toContain('HTTP_PROXY')
+      expect(result).toContain(
+        getPlatform() === 'macos' ? 'sandbox-exec' : 'bwrap',
+      )
     })
   })
 })

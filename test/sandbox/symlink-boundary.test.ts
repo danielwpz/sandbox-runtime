@@ -1,6 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, unlinkSync, lstatSync } from 'node:fs'
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
@@ -479,5 +488,39 @@ describe('Glob Pattern Symlink Boundary', () => {
 
     // Clean up
     cleanupTmpClaude()
+  })
+})
+
+describe('normalizePathForSandbox with missing descendants', () => {
+  it('should resolve a missing file through the nearest existing macOS ancestor', () => {
+    if (getPlatform() !== 'macos') {
+      return
+    }
+
+    const baseDir = mkdtempSync(join(tmpdir(), 'normalize-missing-file-'))
+    const missingFile = join(baseDir, 'missing.txt')
+
+    try {
+      const expectedPath = join(realpathSync(baseDir), 'missing.txt')
+      expect(normalizePathForSandbox(missingFile)).toBe(expectedPath)
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true })
+    }
+  })
+
+  it('should resolve a missing glob base directory through the nearest existing macOS ancestor', () => {
+    if (getPlatform() !== 'macos') {
+      return
+    }
+
+    const baseDir = mkdtempSync(join(tmpdir(), 'normalize-missing-glob-'))
+    const globPath = join(baseDir, 'missing-dir', '**')
+
+    try {
+      const expectedPath = join(realpathSync(baseDir), 'missing-dir', '**')
+      expect(normalizePathForSandbox(globPath)).toBe(expectedPath)
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true })
+    }
   })
 })

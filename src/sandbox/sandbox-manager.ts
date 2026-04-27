@@ -13,6 +13,7 @@ import type {
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
+import { getNetworkRestrictionMode } from './sandbox-schemas.js'
 import {
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
@@ -32,6 +33,7 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import type { SandboxNetworkBlockEvent } from './sandbox-network-event-store.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
@@ -52,6 +54,7 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 const sandboxViolationStore = new SandboxViolationStore()
+let networkBlockedEvents: SandboxNetworkBlockEvent[] = []
 
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -95,12 +98,19 @@ async function filterNetworkRequest(
     return false
   }
 
+  const networkMode = getNetworkRestrictionMode(getNetworkRestrictionConfig())
+
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPattern(host, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
       return false
     }
+  }
+
+  if (networkMode === 'deny_only') {
+    logForDebugging(`Allowed by deny_only config: ${host}:${port}`)
+    return true
   }
 
   // Check allowed domains
@@ -157,12 +167,26 @@ function getMitmSocketPath(host: string): string | undefined {
   return undefined
 }
 
+function getBlockedEventDetail(): string {
+  return (config?.network.mode ?? 'allow_only') === 'deny_only'
+    ? 'blocked-by-denylist'
+    : 'blocked-by-allowlist'
+}
+
 async function startHttpProxyServer(
   sandboxAskCallback?: SandboxAskCallback,
 ): Promise<number> {
   httpProxyServer = createHttpProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
+    onDeniedRequest: (port: number, host: string) => {
+      networkBlockedEvents.push({
+        host,
+        port,
+        detail: getBlockedEventDetail(),
+        timestamp: new Date(),
+      })
+    },
     getMitmSocketPath,
   })
 
@@ -196,6 +220,14 @@ async function startSocksProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
+    onDeniedRequest: (port: number, host: string) => {
+      networkBlockedEvents.push({
+        host,
+        port,
+        detail: getBlockedEventDetail(),
+        timestamp: new Date(),
+      })
+    },
   })
 
   return new Promise<number>((resolve, reject) => {
@@ -391,7 +423,17 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     }
   }
 
+  if (config.filesystem.readMode === 'allow_only') {
+    return {
+      mode: 'allow_only',
+      denyOnly: [],
+      allowOnly: allowPaths,
+      denyWithinAllow: denyPaths,
+    }
+  }
+
   return {
+    mode: 'deny_only',
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
   }
@@ -399,7 +441,11 @@ function getFsReadConfig(): FsReadRestrictionConfig {
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
   if (!config) {
-    return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
+    return {
+      mode: 'allow_only',
+      allowOnly: getDefaultWritePaths(),
+      denyWithinAllow: [],
+    }
   }
 
   // Filter out glob patterns on Linux/WSL for allowWrite (bubblewrap doesn't support globs)
@@ -424,11 +470,17 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
       return true
     })
 
-  // Build allowOnly list: default paths + configured allow paths
-  const allowOnly = [...getDefaultWritePaths(), ...allowPaths]
+  if (config.filesystem.writeMode === 'deny_only') {
+    return {
+      mode: 'deny_only',
+      allowOnly: [],
+      denyWithinAllow: denyPaths,
+    }
+  }
 
   return {
-    allowOnly,
+    mode: 'allow_only',
+    allowOnly: [...getDefaultWritePaths(), ...allowPaths],
     denyWithinAllow: denyPaths,
   }
 }
@@ -442,6 +494,7 @@ function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
   const deniedHosts = config.network.deniedDomains
 
   return {
+    mode: config.network.mode,
     ...(allowedHosts.length > 0 && { allowedHosts }),
     ...(deniedHosts.length > 0 && { deniedHosts }),
   }
@@ -551,15 +604,28 @@ async function wrapWithSandbox(
         }
         return true
       })
+  const effectiveWriteMode =
+    customConfig?.filesystem?.writeMode ??
+    config?.filesystem.writeMode ??
+    'allow_only'
   const userAllowWrite = stripWriteGlobs(
     customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? [],
   )
-  const writeConfig = {
-    allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow: stripWriteGlobs(
-      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-    ),
-  }
+  const userDenyWrite = stripWriteGlobs(
+    customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+  )
+  const writeConfig =
+    effectiveWriteMode === 'deny_only'
+      ? {
+          mode: 'deny_only' as const,
+          allowOnly: [],
+          denyWithinAllow: userDenyWrite,
+        }
+      : {
+          mode: 'allow_only' as const,
+          allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
+          denyWithinAllow: userDenyWrite,
+        }
   const rawDenyRead =
     customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? []
   const expandedDenyRead: string[] = []
@@ -583,33 +649,54 @@ async function wrapWithSandbox(
     }
   }
   const readConfig = {
-    denyOnly: expandedDenyRead,
-    allowWithinDeny: expandedAllowRead,
+    ...(customConfig?.filesystem?.readMode === 'allow_only' ||
+    (customConfig?.filesystem?.readMode === undefined &&
+      config?.filesystem.readMode === 'allow_only')
+      ? {
+          mode: 'allow_only' as const,
+          denyOnly: [],
+          allowOnly: expandedAllowRead,
+          denyWithinAllow: expandedDenyRead,
+        }
+      : {
+          mode: 'deny_only' as const,
+          denyOnly: expandedDenyRead,
+          allowWithinDeny: expandedAllowRead,
+        }),
   }
 
-  // Check if network config is specified - this determines if we need network restrictions
-  // Network restriction is needed when:
-  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
-  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
-  // An empty allowedDomains array means "no domains allowed" = block all network access
-  const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+  const effectiveNetworkMode =
+    customConfig?.network?.mode ?? config?.network.mode ?? 'allow_only'
+  const effectiveAllowedDomains =
+    customConfig?.network?.allowedDomains ?? config?.network.allowedDomains
+  const effectiveDeniedDomains =
+    customConfig?.network?.deniedDomains ?? config?.network.deniedDomains
 
-  // Network RESTRICTION is needed whenever network config is specified
-  // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
+  const needsNetworkRestriction =
+    effectiveNetworkMode === 'deny_only'
+      ? (effectiveDeniedDomains?.length ?? 0) > 0
+      : effectiveAllowedDomains !== undefined
 
-  // Network PROXY is needed whenever network config is specified
-  // Even with empty allowedDomains, we route through proxy so that:
-  // 1. updateConfig() can enable network access for already-running processes
-  // 2. The proxy blocks all requests when allowlist is empty
-  const needsNetworkProxy = hasNetworkConfig
+  // In allow_only mode the proxy is part of enforcement. In deny_only mode we
+  // only need the proxy when there are explicit deny rules to enforce.
+  const needsNetworkProxy = needsNetworkRestriction
 
-  // Wait for network initialization only if proxy is actually needed
-  if (needsNetworkProxy) {
+  // Wait for network initialization before reading proxy ports.
+  if (
+    needsNetworkProxy &&
+    customConfig?.network?.httpProxyPort === undefined &&
+    customConfig?.network?.socksProxyPort === undefined
+  ) {
     await waitForNetworkInitialization()
   }
+
+  const customHttpProxyPort = customConfig?.network?.httpProxyPort
+  const customSocksProxyPort = customConfig?.network?.socksProxyPort
+  const httpProxyPort =
+    customHttpProxyPort ?? (needsNetworkProxy ? getProxyPort() : undefined)
+  const socksProxyPort =
+    customSocksProxyPort ??
+    (needsNetworkProxy ? getSocksProxyPort() : undefined)
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
@@ -620,9 +707,8 @@ async function wrapWithSandbox(
       return wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction,
-        // Only pass proxy ports if proxy is running (when there are domains to filter)
-        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
-        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        httpProxyPort,
+        socksProxyPort,
         readConfig,
         writeConfig,
         allowUnixSockets: getAllowUnixSockets(),
@@ -646,12 +732,8 @@ async function wrapWithSandbox(
         socksSocketPath: needsNetworkProxy
           ? getLinuxSocksSocketPath()
           : undefined,
-        httpProxyPort: needsNetworkProxy
-          ? managerContext?.httpProxyPort
-          : undefined,
-        socksProxyPort: needsNetworkProxy
-          ? managerContext?.socksProxyPort
-          : undefined,
+        httpProxyPort,
+        socksProxyPort,
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
@@ -867,6 +949,15 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
+  networkBlockedEvents = []
+}
+
+function getNetworkBlockedEvents(): SandboxNetworkBlockEvent[] {
+  return [...networkBlockedEvents]
+}
+
+function clearNetworkBlockedEvents(): void {
+  networkBlockedEvents = []
 }
 
 function getSandboxViolationStore() {
@@ -970,6 +1061,8 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
+  getNetworkBlockedEvents(): SandboxNetworkBlockEvent[]
+  clearNetworkBlockedEvents(): void
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
@@ -1007,6 +1100,8 @@ export const SandboxManager: ISandboxManager = {
   cleanupAfterCommand,
   reset,
   getSandboxViolationStore,
+  getNetworkBlockedEvents,
+  clearNetworkBlockedEvents,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
   getConfig,

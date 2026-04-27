@@ -5,6 +5,7 @@ import { logForDebugging } from '../utils/debug.js'
 
 export interface SocksProxyServerOptions {
   filter(port: number, host: string): Promise<boolean> | boolean
+  onDeniedRequest?(port: number, host: string): void
 }
 
 export interface SocksProxyWrapper {
@@ -30,6 +31,7 @@ export function createSocksProxyServer(
       const allowed = await options.filter(port, hostname)
 
       if (!allowed) {
+        options.onDeniedRequest?.(port, hostname)
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })

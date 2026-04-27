@@ -1,4 +1,6 @@
-# Anthropic Sandbox Runtime (srt)
+# Sandbox Runtime (srt) — Pokeclaw fork
+
+A maintained fork of Anthropic Sandbox Runtime published as `@danielwpz/sandbox-runtime`.
 
 A lightweight sandboxing tool for enforcing filesystem and network restrictions on arbitrary processes at the OS level, without requiring a container.
 
@@ -11,7 +13,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g @anthropic-ai/sandbox-runtime
+npm install -g @danielwpz/sandbox-runtime
 ```
 
 ## Basic Usage
@@ -176,7 +178,7 @@ srt --settings /path/to/srt-settings.json npm install
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@danielwpz/sandbox-runtime'
 import { spawn } from 'child_process'
 
 // Define your sandbox configuration
@@ -215,10 +217,10 @@ child.on('exit', async code => {
 
 ```typescript
 // Main sandbox manager
-export { SandboxManager } from '@anthropic-ai/sandbox-runtime'
+export { SandboxManager } from '@danielwpz/sandbox-runtime'
 
 // Violation tracking
-export { SandboxViolationStore } from '@anthropic-ai/sandbox-runtime'
+export { SandboxViolationStore } from '@danielwpz/sandbox-runtime'
 
 // TypeScript types
 export type {
@@ -230,7 +232,7 @@ export type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@danielwpz/sandbox-runtime'
 ```
 
 ## Configuration
@@ -300,17 +302,21 @@ Unix sockets are **blocked by default** on both platforms.
 
 #### Filesystem Configuration
 
-Uses two different patterns:
+Read and write policies can each run in either `deny_only` or `allow_only`
+mode. Omitting the mode preserves the legacy defaults: reads use deny-only,
+writes use allow-only.
 
-**Read restrictions** (deny-then-allow pattern) - all reads allowed by default:
+**Read restrictions**:
 
+- `filesystem.readMode` - Optional `"deny_only"` or `"allow_only"`.
 - `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
-- `filesystem.allowRead` - Array of paths to re-allow read access within denied regions (takes precedence over denyRead). **Note:** this is the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
+- `filesystem.allowRead` - In `deny_only`, paths to re-allow within denied regions. In `allow_only`, paths allowed for reading.
 
-**Write restrictions** (allow-only pattern) - all writes denied by default:
+**Write restrictions**:
 
-- `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
-- `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+- `filesystem.writeMode` - Optional `"allow_only"` or `"deny_only"`.
+- `filesystem.allowWrite` - In `allow_only`, paths allowed for writing. Empty array = no write access.
+- `filesystem.denyWrite` - Paths denied for writing. Takes precedence over write allows.
 
 **Path Syntax (macOS):**
 
@@ -328,6 +334,7 @@ Examples:
 - `"denyRead": ["~/.ssh"]` - Deny read to SSH directory
 - `"denyRead": ["/Users"], "allowRead": ["."]` - Deny read to all of `/Users`, but re-allow the current directory
 - `"denyWrite": [".env"]` - Deny write to `.env` file (even if current directory is allowed)
+- `"writeMode": "deny_only", "denyWrite": ["~/.ssh"]` - Allow writes by default, but block writes to SSH files
 
 **Path Syntax (Linux):**
 
@@ -529,12 +536,13 @@ Filesystem restrictions are enforced at the OS level:
   - Example: `denyRead: ["/Users"], allowRead: ["."]` to block all of `/Users` except the workspace
   - Empty `denyRead: []` = full read access (nothing denied)
 
-- **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
+- **Write**: Allow-only by default. Set `writeMode: "deny_only"` to allow writes everywhere except `denyWrite`.
   - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
   - Empty `allowWrite: []` = no write access (nothing allowed)
-  - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
+  - Example: `writeMode: "deny_only", denyWrite: ["~/.ssh"]` to block only selected paths
+  - `denyWrite` takes precedence over write allows
 
-**Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
+**Precedence:** in read deny-only mode, `allowRead` can re-open paths within a denied region. For writes, `denyWrite` always wins.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 

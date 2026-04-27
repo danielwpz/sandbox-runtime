@@ -13,12 +13,16 @@ const applySeccompPathCache = new Map<string, string | null>()
 let cachedGlobalNpmPaths: string[] | null = null
 
 /**
- * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
+ * Get paths to check for globally installed sandbox-runtime packages.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
  */
 function getGlobalNpmPaths(): string[] {
   if (cachedGlobalNpmPaths) return cachedGlobalNpmPaths
 
+  const packageLocations: Array<[string, string]> = [
+    ['@danielwpz', 'sandbox-runtime'],
+    ['@anthropic-ai', 'sandbox-runtime'],
+  ]
   const paths: string[] = []
 
   // Try to get the actual global npm root
@@ -29,7 +33,9 @@ function getGlobalNpmPaths(): string[] {
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim()
     if (npmRoot) {
-      paths.push(join(npmRoot, '@anthropic-ai', 'sandbox-runtime'))
+      for (const [scope, pkg] of packageLocations) {
+        paths.push(join(npmRoot, scope, pkg))
+      }
     }
   } catch {
     // npm not available or failed
@@ -37,44 +43,18 @@ function getGlobalNpmPaths(): string[] {
 
   // Common global npm locations as fallbacks
   const home = homedir()
-  paths.push(
-    // npm global (Linux/macOS)
-    join('/usr', 'lib', 'node_modules', '@anthropic-ai', 'sandbox-runtime'),
-    join(
-      '/usr',
-      'local',
-      'lib',
-      'node_modules',
-      '@anthropic-ai',
-      'sandbox-runtime',
-    ),
-    // npm global with prefix (common on macOS with homebrew)
-    join(
-      '/opt',
-      'homebrew',
-      'lib',
-      'node_modules',
-      '@anthropic-ai',
-      'sandbox-runtime',
-    ),
-    // User-local npm global
-    join(
-      home,
-      '.npm',
-      'lib',
-      'node_modules',
-      '@anthropic-ai',
-      'sandbox-runtime',
-    ),
-    join(
-      home,
-      '.npm-global',
-      'lib',
-      'node_modules',
-      '@anthropic-ai',
-      'sandbox-runtime',
-    ),
-  )
+  for (const [scope, pkg] of packageLocations) {
+    paths.push(
+      // npm global (Linux/macOS)
+      join('/usr', 'lib', 'node_modules', scope, pkg),
+      join('/usr', 'local', 'lib', 'node_modules', scope, pkg),
+      // npm global with prefix (common on macOS with homebrew)
+      join('/opt', 'homebrew', 'lib', 'node_modules', scope, pkg),
+      // User-local npm global
+      join(home, '.npm', 'lib', 'node_modules', scope, pkg),
+      join(home, '.npm-global', 'lib', 'node_modules', scope, pkg),
+    )
+  }
 
   cachedGlobalNpmPaths = paths
   return paths

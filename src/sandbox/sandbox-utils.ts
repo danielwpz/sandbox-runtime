@@ -234,38 +234,46 @@ export function normalizePathForSandbox(pathPattern: string): string {
         : path.dirname(staticPrefix)
 
       // Try to resolve symlinks for the base directory
-      try {
-        const resolvedBaseDir = fs.realpathSync(baseDir)
-        // Validate that resolution stays within expected boundaries
-        if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
-          // Reconstruct the pattern with the resolved directory
-          const patternSuffix = normalizedPath.slice(baseDir.length)
-          return resolvedBaseDir + patternSuffix
-        }
-        // If resolution would broaden scope, keep original pattern
-      } catch {
-        // If directory doesn't exist or can't be resolved, keep the original pattern
+      const resolvedBaseDir = resolvePathViaNearestExistingAncestor(baseDir)
+      if (resolvedBaseDir !== baseDir) {
+        // Reconstruct the pattern with the resolved directory
+        const patternSuffix = normalizedPath.slice(baseDir.length)
+        return resolvedBaseDir + patternSuffix
       }
     }
     return normalizedPath
   }
 
-  // Resolve symlinks to real paths to avoid bwrap issues
-  // Validate that the resolution stays within expected boundaries
-  try {
-    const resolvedPath = fs.realpathSync(normalizedPath)
+  return resolvePathViaNearestExistingAncestor(normalizedPath)
+}
 
-    // Only use resolved path if it doesn't cross boundary (e.g., symlink to parent dir)
-    if (isSymlinkOutsideBoundary(normalizedPath, resolvedPath)) {
-      // Symlink points outside expected boundaries - keep original path
-    } else {
-      normalizedPath = resolvedPath
+function resolvePathViaNearestExistingAncestor(pathStr: string): string {
+  const originalPath = pathStr
+  const missingSegments: string[] = []
+  let currentPath = pathStr
+
+  while (true) {
+    try {
+      const resolvedPath = fs.realpathSync(currentPath)
+      if (isSymlinkOutsideBoundary(currentPath, resolvedPath)) {
+        return originalPath
+      }
+
+      if (missingSegments.length === 0) {
+        return resolvedPath
+      }
+
+      return path.join(resolvedPath, ...missingSegments.reverse())
+    } catch {
+      const parentPath = path.dirname(currentPath)
+      if (parentPath === currentPath || parentPath === '.') {
+        return originalPath
+      }
+
+      missingSegments.push(path.basename(currentPath))
+      currentPath = parentPath
     }
-  } catch {
-    // If path doesn't exist or can't be resolved, keep the normalized path
   }
-
-  return normalizedPath
 }
 
 /**
