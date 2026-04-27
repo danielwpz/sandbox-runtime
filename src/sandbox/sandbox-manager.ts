@@ -698,8 +698,25 @@ async function wrapWithSandbox(
     customSocksProxyPort ??
     (needsNetworkProxy ? getSocksProxyPort() : undefined)
 
-  // Check custom config to allow pseudo-terminal (can be applied dynamically)
+  const allowUnixSockets =
+    customConfig?.network?.allowUnixSockets ?? getAllowUnixSockets()
+  const allowAllUnixSockets =
+    customConfig?.network?.allowAllUnixSockets ?? getAllowAllUnixSockets()
+  const allowLocalBinding =
+    customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()
+
   const allowPty = customConfig?.allowPty ?? config?.allowPty
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig()
+  const enableWeakerNestedSandbox =
+    customConfig?.enableWeakerNestedSandbox ?? getEnableWeakerNestedSandbox()
+  const enableWeakerNetworkIsolation =
+    customConfig?.enableWeakerNetworkIsolation ??
+    getEnableWeakerNetworkIsolation()
+  const ripgrepConfig = customConfig?.ripgrep ?? getRipgrepConfig()
+  const mandatoryDenySearchDepth =
+    customConfig?.mandatoryDenySearchDepth ?? getMandatoryDenySearchDepth()
+  const seccompConfig = customConfig?.seccomp ?? getSeccompConfig()
 
   switch (platform) {
     case 'macos':
@@ -711,13 +728,14 @@ async function wrapWithSandbox(
         socksProxyPort,
         readConfig,
         writeConfig,
-        allowUnixSockets: getAllowUnixSockets(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
-        ignoreViolations: getIgnoreViolations(),
+        allowUnixSockets,
+        allowAllUnixSockets,
+        allowLocalBinding,
+        ignoreViolations:
+          customConfig?.ignoreViolations ?? getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+        allowGitConfig,
+        enableWeakerNetworkIsolation,
         binShell,
       })
 
@@ -736,13 +754,13 @@ async function wrapWithSandbox(
         socksProxyPort,
         readConfig,
         writeConfig,
-        enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
+        enableWeakerNestedSandbox,
+        allowAllUnixSockets,
         binShell,
-        ripgrepConfig: getRipgrepConfig(),
-        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
-        seccompConfig: getSeccompConfig(),
+        ripgrepConfig,
+        mandatoryDenySearchDepth,
+        allowGitConfig,
+        seccompConfig,
         abortSignal,
       })
 
