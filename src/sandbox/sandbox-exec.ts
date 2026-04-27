@@ -359,6 +359,11 @@ function resolveEffectiveConfig(
         : baseConfig?.filesystem.readMode !== undefined
           ? { readMode: baseConfig.filesystem.readMode }
           : {}),
+      ...(customConfig?.filesystem?.writeMode !== undefined
+        ? { writeMode: customConfig.filesystem.writeMode }
+        : baseConfig?.filesystem.writeMode !== undefined
+          ? { writeMode: baseConfig.filesystem.writeMode }
+          : {}),
       denyRead:
         customConfig?.filesystem?.denyRead ??
         baseConfig?.filesystem.denyRead ??

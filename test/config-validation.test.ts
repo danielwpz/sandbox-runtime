@@ -99,6 +99,7 @@ describe('Config Validation', () => {
       },
       filesystem: {
         readMode: 'allow_only',
+        writeMode: 'deny_only',
         denyRead: ['/etc/shadow'],
         allowWrite: ['/tmp'],
         denyWrite: ['/etc'],
@@ -124,6 +125,7 @@ describe('Config Validation', () => {
       },
       filesystem: {
         readMode: 'wrong_mode',
+        writeMode: 'wrong_mode',
         denyRead: [],
         allowWrite: [],
         denyWrite: [],

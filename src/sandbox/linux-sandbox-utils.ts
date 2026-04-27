@@ -22,6 +22,7 @@ import type {
 } from './sandbox-schemas.js'
 import {
   getFsReadRestrictionMode,
+  getFsWriteRestrictionMode,
   hasFsReadRestrictions,
 } from './sandbox-schemas.js'
 import {
@@ -88,9 +89,8 @@ function findSymlinkInPath(
       const stats = fs.lstatSync(nextPath)
       if (stats.isSymbolicLink()) {
         // Check if this symlink is within an allowed write path
-        const isWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            nextPath.startsWith(allowedPath + '/') || nextPath === allowedPath,
+        const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+          isSameOrWithinPath(allowedPath, nextPath),
         )
         if (isWithinAllowedPath) {
           return nextPath
@@ -104,6 +104,17 @@ function findSymlinkInPath(
   }
 
   return null
+}
+
+function isSameOrWithinPath(basePath: string, candidatePath: string): boolean {
+  const normalizedBase = normalizePathForSandbox(basePath)
+  const normalizedCandidate = normalizePathForSandbox(candidatePath)
+
+  return (
+    normalizedBase === '/' ||
+    normalizedCandidate === normalizedBase ||
+    normalizedCandidate.startsWith(normalizedBase + '/')
+  )
 }
 
 /**
@@ -709,61 +720,71 @@ async function generateFilesystemArgs(
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
-    // Write restrictions: Start with read-only root, then allow writes to specific paths
-    args.push('--ro-bind', '/', '/')
-
-    // Collect normalized allowed write paths for later checking
+    const writeMode = getFsWriteRestrictionMode(writeConfig)
     const allowedWritePaths: string[] = []
 
-    // Allow writes to specific paths
-    for (const pathPattern of writeConfig.allowOnly || []) {
-      const normalizedPath = normalizePathForSandbox(pathPattern)
+    if (writeMode === 'deny_only') {
+      // Deny-only writes keep the host filesystem writable by default, then
+      // mount denied paths back as read-only or masked entries below.
+      args.push('--bind', '/', '/')
+      allowedWritePaths.push('/')
+    } else {
+      // Allow-only writes start with read-only root, then allow writes to
+      // specific paths.
+      args.push('--ro-bind', '/', '/')
 
-      logForDebugging(
-        `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
-      )
+      // Allow writes to specific paths
+      for (const pathPattern of writeConfig.allowOnly || []) {
+        const normalizedPath = normalizePathForSandbox(pathPattern)
 
-      // Skip /dev/* paths since --dev /dev already handles them
-      if (normalizedPath.startsWith('/dev/')) {
-        logForDebugging(`[Sandbox Linux] Skipping /dev path: ${normalizedPath}`)
-        continue
-      }
-
-      if (!fs.existsSync(normalizedPath)) {
         logForDebugging(
-          `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+          `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
         )
-        continue
-      }
 
-      // Check if path is a symlink pointing outside expected boundaries
-      // bwrap follows symlinks, so --bind on a symlink makes the target writable
-      // This could unexpectedly expose paths the user didn't intend to allow
-      try {
-        const resolvedPath = fs.realpathSync(normalizedPath)
-        // Trim trailing slashes before comparing: realpathSync never returns
-        // a trailing slash, but normalizedPath may have one, which would cause
-        // a false mismatch and incorrectly treat the path as a symlink.
-        const normalizedForComparison = normalizedPath.replace(/\/+$/, '')
-        if (
-          resolvedPath !== normalizedForComparison &&
-          isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
-        ) {
+        // Skip /dev/* paths since --dev /dev already handles them
+        if (normalizedPath.startsWith('/dev/')) {
           logForDebugging(
-            `[Sandbox Linux] Skipping symlink write path pointing outside expected location: ${pathPattern} -> ${resolvedPath}`,
+            `[Sandbox Linux] Skipping /dev path: ${normalizedPath}`,
           )
           continue
         }
-      } catch {
-        // realpathSync failed - path might not exist or be accessible, skip it
-        logForDebugging(
-          `[Sandbox Linux] Skipping write path that could not be resolved: ${normalizedPath}`,
-        )
-        continue
-      }
 
-      args.push('--bind', normalizedPath, normalizedPath)
-      allowedWritePaths.push(normalizedPath)
+        if (!fs.existsSync(normalizedPath)) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+          )
+          continue
+        }
+
+        // Check if path is a symlink pointing outside expected boundaries
+        // bwrap follows symlinks, so --bind on a symlink makes the target writable
+        // This could unexpectedly expose paths the user didn't intend to allow
+        try {
+          const resolvedPath = fs.realpathSync(normalizedPath)
+          // Trim trailing slashes before comparing: realpathSync never returns
+          // a trailing slash, but normalizedPath may have one, which would cause
+          // a false mismatch and incorrectly treat the path as a symlink.
+          const normalizedForComparison = normalizedPath.replace(/\/+$/, '')
+          if (
+            resolvedPath !== normalizedForComparison &&
+            isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
+          ) {
+            logForDebugging(
+              `[Sandbox Linux] Skipping symlink write path pointing outside expected location: ${pathPattern} -> ${resolvedPath}`,
+            )
+            continue
+          }
+        } catch {
+          // realpathSync failed - path might not exist or be accessible, skip it
+          logForDebugging(
+            `[Sandbox Linux] Skipping write path that could not be resolved: ${normalizedPath}`,
+          )
+          continue
+        }
+
+        args.push('--bind', normalizedPath, normalizedPath)
+        allowedWritePaths.push(normalizedPath)
+      }
     }
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
@@ -827,9 +848,8 @@ async function generateFilesystemArgs(
         // If not, the path is already read-only from --ro-bind / /.
         const ancestorIsWithinAllowedPath = allowedWritePaths.some(
           allowedPath =>
-            ancestorPath.startsWith(allowedPath + '/') ||
-            ancestorPath === allowedPath ||
-            normalizedPath.startsWith(allowedPath + '/'),
+            isSameOrWithinPath(allowedPath, ancestorPath) ||
+            isSameOrWithinPath(allowedPath, normalizedPath),
         )
 
         if (ancestorIsWithinAllowedPath) {
@@ -867,10 +887,8 @@ async function generateFilesystemArgs(
 
       // Only add deny binding if this path is within an allowed write path
       // Otherwise it's already read-only from the initial --ro-bind / /
-      const isWithinAllowedPath = allowedWritePaths.some(
-        allowedPath =>
-          normalizedPath.startsWith(allowedPath + '/') ||
-          normalizedPath === allowedPath,
+      const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+        isSameOrWithinPath(allowedPath, normalizedPath),
       )
 
       if (isWithinAllowedPath) {

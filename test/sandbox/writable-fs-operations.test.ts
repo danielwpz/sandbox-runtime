@@ -294,6 +294,108 @@ registerBasicWritableOperationSuite({
   cleanupRoot: MANDATORY_DENY_ROOT,
 })
 
+const DENY_ONLY_WRITE_ROOT = join(
+  tmpdir(),
+  `writable-fs-ops-deny-only-${Date.now()}`,
+)
+const DENY_ONLY_PROTECTED_FILE = join(DENY_ONLY_WRITE_ROOT, 'protected.txt')
+const DENY_ONLY_PROTECTED_DIR = join(DENY_ONLY_WRITE_ROOT, 'protected-dir')
+
+function seedDenyOnlyWriteFixture(): void {
+  seedBasicWritableFixture(DENY_ONLY_WRITE_ROOT)
+  mkdirSync(DENY_ONLY_PROTECTED_DIR, { recursive: true })
+  writeFileSync(DENY_ONLY_PROTECTED_FILE, 'PROTECTED_ORIGINAL\n')
+  writeFileSync(
+    join(DENY_ONLY_PROTECTED_DIR, 'secret.txt'),
+    'PROTECTED_DIR_ORIGINAL\n',
+  )
+}
+
+registerBasicWritableOperationSuite({
+  suiteName:
+    'basic writable filesystem operations remain allowed for deny_only write mode',
+  cwd: DENY_ONLY_WRITE_ROOT,
+  readConfig: undefined,
+  writeConfig: {
+    mode: 'deny_only',
+    allowOnly: [],
+    denyWithinAllow: [DENY_ONLY_PROTECTED_FILE, DENY_ONLY_PROTECTED_DIR],
+  },
+  seed() {
+    seedDenyOnlyWriteFixture()
+  },
+  cleanupRoot: DENY_ONLY_WRITE_ROOT,
+})
+
+describe('deny_only write protections block configured paths', () => {
+  beforeAll(() => {
+    if (skipIfUnsupportedPlatform()) {
+      return
+    }
+
+    seedDenyOnlyWriteFixture()
+  })
+
+  beforeEach(() => {
+    if (skipIfUnsupportedPlatform()) {
+      return
+    }
+
+    seedDenyOnlyWriteFixture()
+  })
+
+  afterAll(() => {
+    rmSync(DENY_ONLY_WRITE_ROOT, { recursive: true, force: true })
+  })
+
+  it('blocks overwriting a deny_only write file', async () => {
+    if (skipIfUnsupportedPlatform()) {
+      return
+    }
+
+    const result = await runSandboxedCommand({
+      cwd: DENY_ONLY_WRITE_ROOT,
+      command: "echo 'BLOCKED' > 'protected.txt'",
+      readConfig: undefined,
+      writeConfig: {
+        mode: 'deny_only',
+        allowOnly: [],
+        denyWithinAllow: [DENY_ONLY_PROTECTED_FILE],
+      },
+    })
+
+    expect(result.status).not.toBe(0)
+    expectNotSandboxApply(result.stderr || '')
+    expect(readFileSync(DENY_ONLY_PROTECTED_FILE, 'utf8')).toBe(
+      'PROTECTED_ORIGINAL\n',
+    )
+  })
+
+  it('blocks moving a deny_only write directory', async () => {
+    if (skipIfUnsupportedPlatform()) {
+      return
+    }
+
+    const result = await runSandboxedCommand({
+      cwd: DENY_ONLY_WRITE_ROOT,
+      command: "mv 'protected-dir' 'moved-protected-dir'",
+      readConfig: undefined,
+      writeConfig: {
+        mode: 'deny_only',
+        allowOnly: [],
+        denyWithinAllow: [DENY_ONLY_PROTECTED_DIR],
+      },
+    })
+
+    expect(result.status).not.toBe(0)
+    expectNotSandboxApply(result.stderr || '')
+    expect(existsSync(DENY_ONLY_PROTECTED_DIR)).toBe(true)
+    expect(existsSync(join(DENY_ONLY_WRITE_ROOT, 'moved-protected-dir'))).toBe(
+      false,
+    )
+  })
+})
+
 describe('mandatory deny protections still block dangerous move operations', () => {
   beforeAll(() => {
     if (skipIfUnsupportedPlatform()) {

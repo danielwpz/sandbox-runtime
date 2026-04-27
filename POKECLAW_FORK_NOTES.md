@@ -1,5 +1,31 @@
 # Pokeclaw Fork Notes
 
+## 2026-04-27 Issue POK-10: add write deny-only policy mode
+
+- upstream branch: `origin/main`
+- upstream base: `7a725a3df560b91b48d1c3860e8d9b16be306a1a`
+- local branch: `pok-10-sandbox-write-deny-only`
+- local commit: `worktree pending`
+- change:
+  - `src/sandbox/sandbox-config.ts`
+  - `src/sandbox/sandbox-exec.ts`
+  - `src/sandbox/sandbox-manager.ts`
+  - `src/sandbox/sandbox-schemas.ts`
+  - `src/sandbox/linux-sandbox-utils.ts`
+  - `src/sandbox/macos-sandbox-utils.ts`
+  - `test/config-validation.test.ts`
+  - `test/sandbox/wrap-with-sandbox.test.ts`
+  - `test/sandbox/writable-fs-operations.test.ts`
+- reason:
+  - added `filesystem.writeMode = "deny_only"` so callers can allow writes by
+    default while still blocking configured deny paths and mandatory deny paths
+  - keeps legacy write behavior unchanged when `writeMode` is omitted
+  - enables Pokoclaw bash full-access execution to run inside a high-permission
+    sandbox instead of bypassing sandbox-runtime
+- validation:
+  - `npm run typecheck`
+  - `bun test test/config-validation.test.ts test/sandbox/wrap-with-sandbox.test.ts test/sandbox/writable-fs-operations.test.ts`
+
 ## 2026-03-24
 
 - upstream branch: `origin/main`

@@ -441,7 +441,11 @@ function getFsReadConfig(): FsReadRestrictionConfig {
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
   if (!config) {
-    return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
+    return {
+      mode: 'allow_only',
+      allowOnly: getDefaultWritePaths(),
+      denyWithinAllow: [],
+    }
   }
 
   // Filter out glob patterns on Linux/WSL for allowWrite (bubblewrap doesn't support globs)
@@ -466,11 +470,17 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
       return true
     })
 
-  // Build allowOnly list: default paths + configured allow paths
-  const allowOnly = [...getDefaultWritePaths(), ...allowPaths]
+  if (config.filesystem.writeMode === 'deny_only') {
+    return {
+      mode: 'deny_only',
+      allowOnly: [],
+      denyWithinAllow: denyPaths,
+    }
+  }
 
   return {
-    allowOnly,
+    mode: 'allow_only',
+    allowOnly: [...getDefaultWritePaths(), ...allowPaths],
     denyWithinAllow: denyPaths,
   }
 }
@@ -594,15 +604,28 @@ async function wrapWithSandbox(
         }
         return true
       })
+  const effectiveWriteMode =
+    customConfig?.filesystem?.writeMode ??
+    config?.filesystem.writeMode ??
+    'allow_only'
   const userAllowWrite = stripWriteGlobs(
     customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? [],
   )
-  const writeConfig = {
-    allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow: stripWriteGlobs(
-      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-    ),
-  }
+  const userDenyWrite = stripWriteGlobs(
+    customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+  )
+  const writeConfig =
+    effectiveWriteMode === 'deny_only'
+      ? {
+          mode: 'deny_only' as const,
+          allowOnly: [],
+          denyWithinAllow: userDenyWrite,
+        }
+      : {
+          mode: 'allow_only' as const,
+          allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
+          denyWithinAllow: userDenyWrite,
+        }
   const rawDenyRead =
     customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? []
   const expandedDenyRead: string[] = []

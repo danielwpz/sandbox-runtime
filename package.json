@@ -1,6 +1,6 @@
 {
   "name": "@danielwpz/sandbox-runtime",
-  "version": "0.0.43-pokeclaw.0",
+  "version": "0.0.43-pokeclaw.1",
   "description": "Pokeclaw fork of Anthropic Sandbox Runtime (ASRT)",
   "type": "module",
   "main": "./dist/index.js",

@@ -417,6 +417,48 @@ describe('restriction pattern semantics', () => {
     })
   })
 
+  describe('write restrictions (deny-only pattern)', () => {
+    it('deny_only write mode means has write restrictions on Linux', async () => {
+      if (getPlatform() !== 'linux') {
+        return
+      }
+
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: {
+          mode: 'deny_only',
+          allowOnly: [],
+          denyWithinAllow: ['/tmp/blocked-write'],
+        },
+      })
+
+      expect(result).not.toBe(command)
+      expect(result).toContain('bwrap')
+    })
+
+    it('deny_only write mode means has write restrictions on macOS', () => {
+      if (getPlatform() !== 'macos') {
+        return
+      }
+
+      const result = wrapCommandWithSandboxMacOS({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: {
+          mode: 'deny_only',
+          allowOnly: [],
+          denyWithinAllow: ['/tmp/blocked-write'],
+        },
+      })
+
+      expect(result).not.toBe(command)
+      expect(result).toContain('sandbox-exec')
+    })
+  })
+
   describe('network restrictions', () => {
     it('needsNetworkRestriction false skips network sandbox on Linux', async () => {
       if (getPlatform() !== 'linux') {

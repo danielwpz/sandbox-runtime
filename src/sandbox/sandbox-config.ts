@@ -138,6 +138,14 @@ export const FilesystemConfigSchema = z.object({
         '"deny_only" = deny denyRead and re-allow allowRead. ' +
         '"allow_only" = allow only allowRead, with denyRead blocking paths inside allowed regions.',
     ),
+  writeMode: z
+    .enum(['allow_only', 'deny_only'])
+    .optional()
+    .describe(
+      'Write policy mode. Omit to keep legacy allowlist behavior. ' +
+        '"allow_only" = only allowWrite may be written, with denyWrite blocking paths inside allowed regions. ' +
+        '"deny_only" = deny denyWrite and allow writing everything else.',
+    ),
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)

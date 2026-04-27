@@ -20,6 +20,7 @@ import type {
 } from './sandbox-schemas.js'
 import {
   getFsReadRestrictionMode,
+  getFsWriteRestrictionMode,
   hasFsReadRestrictions,
 } from './sandbox-schemas.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
@@ -535,26 +536,31 @@ function generateWriteRules(
   }
 
   const rules: string[] = []
+  const writeMode = getFsWriteRestrictionMode(config)
 
-  // Generate allow rules
-  for (const pathPattern of config.allowOnly || []) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
+  if (writeMode === 'deny_only') {
+    rules.push(`(allow file-write*)`)
+  } else {
+    // Generate allow rules
+    for (const pathPattern of config.allowOnly || []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
 
-    if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
-      rules.push(
-        `(allow file-write*`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
-    } else {
-      // Use subpath matching for literal paths
-      rules.push(
-        `(allow file-write*`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
+      if (containsGlobChars(normalizedPath)) {
+        // Use regex matching for glob patterns
+        const regexPattern = globToRegex(normalizedPath)
+        rules.push(
+          `(allow file-write*`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      } else {
+        // Use subpath matching for literal paths
+        rules.push(
+          `(allow file-write*`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
     }
   }
 
@@ -967,13 +973,7 @@ export function wrapCommandWithSandboxMacOS(
   logForDebugging(
     `[Sandbox macOS] Applied restrictions - network: ${!!(httpProxyPort || socksProxyPort)}, read: ${
       readConfig ? getFsReadRestrictionMode(readConfig) : 'none'
-    }, write: ${
-      writeConfig
-        ? 'allowAllExcept' in writeConfig
-          ? 'allowAllExcept'
-          : 'denyAllExcept'
-        : 'none'
-    }`,
+    }, write: ${writeConfig ? getFsWriteRestrictionMode(writeConfig) : 'none'}`,
   )
 
   return wrappedCommand

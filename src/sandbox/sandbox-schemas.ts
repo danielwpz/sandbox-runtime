@@ -1,6 +1,7 @@
 // Filesystem and network restriction configs built from public sandbox config.
 
 export type FsReadRestrictionMode = 'deny_only' | 'allow_only'
+export type FsWriteRestrictionMode = 'allow_only' | 'deny_only'
 export type NetworkRestrictionMode = 'allow_only' | 'deny_only'
 
 /**
@@ -25,18 +26,22 @@ export interface FsReadRestrictionConfig {
 }
 
 /**
- * Write restriction config using an "allow-only" pattern.
+ * Write restriction config.
  *
  * Semantics:
  * - `undefined` = no restrictions (allow all writes)
+ * - `{mode: "deny_only", denyWithinAllow: [...]}` = deny writes to these paths,
+ *   allow all others
  * - `{allowOnly: [], denyWithinAllow: []}` = maximally restrictive (deny ALL writes)
  * - `{allowOnly: [...paths], denyWithinAllow: [...]}` = allow writes only to these paths,
  *   with exceptions for denyWithinAllow
  *
- * This is maximally restrictive by default - only explicitly allowed paths are writable.
- * Note: Empty `allowOnly` means NO paths are writable (unlike read's empty denyOnly).
+ * This is maximally restrictive by default when mode is omitted - only explicitly
+ * allowed paths are writable. Note: Empty `allowOnly` means NO paths are writable
+ * in allow-only mode (unlike read's empty denyOnly).
  */
 export interface FsWriteRestrictionConfig {
+  mode?: FsWriteRestrictionMode
   allowOnly: string[]
   denyWithinAllow: string[]
 }
@@ -79,6 +84,12 @@ export function hasFsReadRestrictions(
   }
 
   return config.denyOnly.length > 0
+}
+
+export function getFsWriteRestrictionMode(
+  config: FsWriteRestrictionConfig | undefined,
+): FsWriteRestrictionMode {
+  return config?.mode ?? 'allow_only'
 }
 
 export function getNetworkRestrictionMode(
