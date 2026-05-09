@@ -24,6 +24,11 @@
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
     "format": "prettier --write 'src/**/*.ts' --cache --log-level warn",
+    "linux:docker": "scripts/linux-docker.sh",
+    "linux:test": "scripts/linux-docker.sh test",
+    "linux:unit": "scripts/linux-docker.sh unit",
+    "linux:integration": "scripts/linux-docker.sh integration",
+    "linux:node-runtime": "scripts/linux-docker.sh node-runtime",
     "prepublishOnly": "npm run clean && npm run build",
     "prepare": "husky"
   },
