@@ -1,4 +1,3 @@
-import shellquote from 'shell-quote'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
@@ -66,6 +65,22 @@ export interface LinuxSandboxParams {
 
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
+
+function quoteShellArg(arg: string): string {
+  if (arg === '') {
+    return "''"
+  }
+
+  if (/^[A-Za-z0-9_/:=.,+-]+$/.test(arg)) {
+    return arg
+  }
+
+  return `'${arg.replace(/'/g, "'\\''")}'`
+}
+
+function quoteShellArgs(args: string[]): string {
+  return args.map(quoteShellArg).join(' ')
+}
 
 /**
  * Find if any component of the path is a symlink within the allowed write paths.
@@ -683,7 +698,7 @@ function buildSandboxCommand(
       )
     }
 
-    const applySeccompCmd = shellquote.quote([
+    const applySeccompCmd = quoteShellArgs([
       applySeccompBinary,
       seccompFilterPath,
       shellPath,
@@ -691,16 +706,15 @@ function buildSandboxCommand(
       userCommand,
     ])
 
-    const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    return [...socatCommands, applySeccompCmd].join('\n')
   } else {
     // No seccomp filter - run user command directly
     const innerScript = [
       ...socatCommands,
-      `eval ${shellquote.quote([userCommand])}`,
+      `eval ${quoteShellArg(userCommand)}`,
     ].join('\n')
 
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    return innerScript
   }
 }
 
@@ -716,12 +730,77 @@ async function generateFilesystemArgs(
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
+  const allowedWritePaths: string[] = []
+  const moveBlockingMounts = new Set<string>()
   // fs already imported
+
+  const isPathWritable = (pathStr: string): boolean =>
+    allowedWritePaths.some(allowedPath =>
+      isSameOrWithinPath(allowedPath, pathStr),
+    )
+
+  const appendReadAllowBind = (pathStr: string): void => {
+    args.push(
+      isPathWritable(pathStr) ? '--bind' : '--ro-bind',
+      pathStr,
+      pathStr,
+    )
+  }
+
+  const appendWritableRebindsWithin = (readAllowedPath: string): void => {
+    for (const writePath of allowedWritePaths) {
+      if (
+        writePath === '/' ||
+        writePath.startsWith('/dev/') ||
+        !isSameOrWithinPath(readAllowedPath, writePath) ||
+        !fs.existsSync(writePath)
+      ) {
+        continue
+      }
+
+      args.push('--bind', writePath, writePath)
+    }
+  }
+
+  const appendMoveBlockingAncestorMounts = (protectedPath: string): void => {
+    const boundary = allowedWritePaths
+      .filter(allowedPath => isSameOrWithinPath(allowedPath, protectedPath))
+      .sort((left, right) => right.length - left.length)[0]
+
+    if (!boundary) {
+      return
+    }
+
+    const normalizedBoundary = normalizePathForSandbox(boundary)
+    let currentPath = path.dirname(protectedPath)
+
+    while (
+      currentPath !== '/' &&
+      currentPath !== normalizedBoundary &&
+      isSameOrWithinPath(normalizedBoundary, currentPath)
+    ) {
+      if (!moveBlockingMounts.has(currentPath) && fs.existsSync(currentPath)) {
+        try {
+          if (fs.statSync(currentPath).isDirectory()) {
+            args.push('--bind', currentPath, currentPath)
+            moveBlockingMounts.add(currentPath)
+          }
+        } catch {
+          // Skip paths that disappear while preparing bwrap arguments.
+        }
+      }
+
+      const parentPath = path.dirname(currentPath)
+      if (parentPath === currentPath) {
+        break
+      }
+      currentPath = parentPath
+    }
+  }
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     const writeMode = getFsWriteRestrictionMode(writeConfig)
-    const allowedWritePaths: string[] = []
 
     if (writeMode === 'deny_only') {
       // Deny-only writes keep the host filesystem writable by default, then
@@ -892,6 +971,7 @@ async function generateFilesystemArgs(
       )
 
       if (isWithinAllowedPath) {
+        appendMoveBlockingAncestorMounts(normalizedPath)
         args.push('--ro-bind', normalizedPath, normalizedPath)
       } else {
         logForDebugging(
@@ -952,7 +1032,8 @@ async function generateFilesystemArgs(
         continue
       }
 
-      args.push('--ro-bind', allowPath, allowPath)
+      appendReadAllowBind(allowPath)
+      appendWritableRebindsWithin(allowPath)
       logForDebugging(
         `[Sandbox Linux] Allowed read path in allow_only mode: ${allowPath}`,
       )
@@ -968,8 +1049,10 @@ async function generateFilesystemArgs(
 
       const denyStat = fs.statSync(denyPath)
       if (denyStat.isDirectory()) {
+        appendMoveBlockingAncestorMounts(denyPath)
         args.push('--tmpfs', denyPath)
       } else {
+        appendMoveBlockingAncestorMounts(denyPath)
         args.push('--ro-bind', '/dev/null', denyPath)
       }
 
@@ -1009,7 +1092,8 @@ async function generateFilesystemArgs(
             continue
           }
           // Bind the allowed path back over the tmpfs so it's readable
-          args.push('--ro-bind', allowPath, allowPath)
+          appendReadAllowBind(allowPath)
+          appendWritableRebindsWithin(allowPath)
           logForDebugging(
             `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
           )
@@ -1290,7 +1374,7 @@ export async function wrapCommandWithSandboxLinux(
         )
       }
 
-      const applySeccompCmd = shellquote.quote([
+      const applySeccompCmd = quoteShellArgs([
         applySeccompBinary,
         seccompFilterPath,
         shell,
@@ -1303,7 +1387,7 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // Build the outer bwrap command
-    const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
+    const wrappedCommand = quoteShellArgs(['bwrap', ...bwrapArgs])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')

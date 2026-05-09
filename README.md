@@ -16,6 +16,30 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 npm install -g @danielwpz/sandbox-runtime
 ```
 
+## Linux Docker Development
+
+On macOS, use the reusable Docker helper to run the Linux build and full test
+suite in a Debian-based container:
+
+```bash
+npm run linux:test
+```
+
+Useful focused commands:
+
+```bash
+npm run linux:unit
+npm run linux:integration
+npm run linux:node-runtime
+npm run linux:docker -- shell
+npm run linux:docker -- run -- npm run build
+```
+
+The image is intentionally based on `node:22-bookworm-slim` and keeps
+dependencies in named Docker volumes so repeated runs do not reinstall
+everything from scratch. Override the default platform or image name with
+`SANDBOX_RUNTIME_LINUX_PLATFORM` or `SANDBOX_RUNTIME_LINUX_IMAGE` when needed.
+
 ## Basic Usage
 
 ```bash
