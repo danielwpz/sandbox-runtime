@@ -1,4 +1,3 @@
-import shellquote from 'shell-quote'
 import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
@@ -957,9 +956,10 @@ export function wrapCommandWithSandboxMacOS(
     throw new Error(`Shell '${shellName}' not found in PATH`)
   }
 
-  // Use `env` command to set environment variables - each VAR=value is a separate
-  // argument that shellquote handles properly, avoiding shell quoting issues
-  const wrappedCommand = shellquote.quote([
+  // Use `env` command to set environment variables. Quote every argv element
+  // with POSIX single-quote semantics so shell parameters such as `$!` survive
+  // the outer launcher and are expanded only by the requested inner shell.
+  const wrappedCommand = quoteShellArgs([
     'env',
     ...proxyEnvArgs,
     'sandbox-exec',
@@ -977,6 +977,22 @@ export function wrapCommandWithSandboxMacOS(
   )
 
   return wrappedCommand
+}
+
+function quoteShellArg(arg: string): string {
+  if (arg === '') {
+    return "''"
+  }
+
+  if (/^[A-Za-z0-9_/:=.,+-]+$/.test(arg)) {
+    return arg
+  }
+
+  return `'${arg.replace(/'/g, "'\\''")}'`
+}
+
+function quoteShellArgs(args: string[]): string {
+  return args.map(quoteShellArg).join(' ')
 }
 
 /**

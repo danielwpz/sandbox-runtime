@@ -5,15 +5,21 @@ import { encodeSandboxedCommand } from './sandbox-utils.js'
  * In-memory tail for sandbox violations
  */
 export class SandboxViolationStore {
-  private violations: SandboxViolationEvent[] = []
+  private violations: Array<{
+    sequence: number
+    event: SandboxViolationEvent
+  }> = []
   private totalCount = 0
   private readonly maxSize = 100
   private listeners: Set<(violations: SandboxViolationEvent[]) => void> =
     new Set()
 
   addViolation(violation: SandboxViolationEvent): void {
-    this.violations.push(violation)
     this.totalCount++
+    this.violations.push({
+      sequence: this.totalCount,
+      event: violation,
+    })
     if (this.violations.length > this.maxSize) {
       this.violations = this.violations.slice(-this.maxSize)
     }
@@ -22,9 +28,9 @@ export class SandboxViolationStore {
 
   getViolations(limit?: number): SandboxViolationEvent[] {
     if (limit === undefined) {
-      return [...this.violations]
+      return this.violations.map(({ event }) => event)
     }
-    return this.violations.slice(-limit)
+    return this.violations.slice(-limit).map(({ event }) => event)
   }
 
   getCount(): number {
@@ -37,7 +43,22 @@ export class SandboxViolationStore {
 
   getViolationsForCommand(command: string): SandboxViolationEvent[] {
     const commandBase64 = encodeSandboxedCommand(command)
-    return this.violations.filter(v => v.encodedCommand === commandBase64)
+    return this.violations
+      .map(({ event }) => event)
+      .filter(v => v.encodedCommand === commandBase64)
+  }
+
+  getViolationsForCommandSince(
+    command: string,
+    afterSequence: number,
+  ): SandboxViolationEvent[] {
+    const commandBase64 = encodeSandboxedCommand(command)
+    return this.violations
+      .filter(
+        ({ sequence, event }) =>
+          sequence > afterSequence && event.encodedCommand === commandBase64,
+      )
+      .map(({ event }) => event)
   }
 
   clear(): void {

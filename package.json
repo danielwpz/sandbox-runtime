@@ -1,6 +1,6 @@
 {
   "name": "@danielwpz/sandbox-runtime",
-  "version": "0.0.43-pokeclaw.3",
+  "version": "0.0.43-pokeclaw.4",
   "description": "Pokeclaw fork of Anthropic Sandbox Runtime (ASRT)",
   "type": "module",
   "main": "./dist/index.js",
@@ -30,7 +30,7 @@
     "linux:integration": "scripts/linux-docker.sh integration",
     "linux:node-runtime": "scripts/linux-docker.sh node-runtime",
     "prepublishOnly": "npm run clean && npm run build",
-    "prepare": "husky"
+    "prepare": "npm run build && husky"
   },
   "dependencies": {
     "@pondwader/socks5-server": "^1.0.10",

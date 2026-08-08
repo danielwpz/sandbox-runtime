@@ -6,6 +6,7 @@ import {
   SandboxManager,
   executeSandboxedCommand,
   isSandboxPermissionError,
+  startSandboxedCommand,
 } from '../../src/index.js'
 import { getPlatform } from '../../src/utils/platform.js'
 
@@ -170,6 +171,71 @@ describe('executeSandboxedCommand', () => {
     )
 
     expect(result.exitCode).toBe(0)
+  })
+})
+
+describe('startSandboxedCommand', () => {
+  let testDir: string
+
+  beforeEach(async () => {
+    testDir = createTestDir()
+    mkdirSync(join(testDir, 'allow'), { recursive: true })
+    await SandboxManager.reset()
+  })
+
+  afterEach(async () => {
+    await SandboxManager.reset()
+    rmSync(testDir, { recursive: true, force: true })
+  })
+
+  it('exposes output streams and returns the same settled result to every waiter', async () => {
+    await SandboxManager.initialize(createConfig(testDir), undefined, true)
+
+    const handle = await startSandboxedCommand(
+      `printf 'first\\n'; sleep 0.05; printf 'second\\n'`,
+    )
+    const streamed: string[] = []
+    handle.stdout?.on('data', chunk => streamed.push(chunk.toString()))
+
+    const firstResult = await handle.wait()
+    const secondResult = await handle.wait()
+
+    expect(handle.pid).toBeNumber()
+    expect(streamed.join('')).toBe('first\nsecond\n')
+    expect(firstResult).toEqual({
+      stdout: 'first\nsecond\n',
+      stderr: '',
+      exitCode: 0,
+      signal: null,
+    })
+    expect(secondResult).toEqual(firstResult)
+  })
+
+  it('terminates a running command and settles its wait promise', async () => {
+    await SandboxManager.initialize(createConfig(testDir), undefined, true)
+
+    const handle = await startSandboxedCommand('while true; do sleep 1; done')
+    await handle.terminate({ graceMs: 50 })
+    const result = await handle.wait()
+
+    expect(result.exitCode).toBeNull()
+    expect(result.signal).not.toBeNull()
+  })
+
+  it('bounds captured wait output while leaving the live stream available', async () => {
+    await SandboxManager.initialize(createConfig(testDir), undefined, true)
+
+    const handle = await startSandboxedCommand(`printf '1234567890'`, {
+      maxOutputChars: 4,
+    })
+    let streamed = ''
+    handle.stdout?.on('data', chunk => {
+      streamed += chunk.toString()
+    })
+    const result = await handle.wait()
+
+    expect(streamed).toBe('1234567890')
+    expect(result.stdout).toBe('7890')
   })
 })
 

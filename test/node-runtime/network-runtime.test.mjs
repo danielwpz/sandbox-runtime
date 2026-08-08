@@ -1,6 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
@@ -8,6 +14,7 @@ import {
   SandboxManager,
   executeSandboxedCommand,
   isSandboxPermissionError,
+  startSandboxedCommand,
 } from '../../dist/index.js'
 
 function createTestDir() {
@@ -273,6 +280,7 @@ test('executeSandboxedCommand abort kills the shell process group', async () => 
   const testDir = createTestDir()
   const allowDir = join(testDir, 'allow')
   const heartbeatPath = join(allowDir, 'heartbeat.log')
+  const childPidPath = join(allowDir, 'child.pid')
   mkdirSync(allowDir, { recursive: true })
 
   try {
@@ -280,27 +288,135 @@ test('executeSandboxedCommand abort kills the shell process group', async () => 
     await SandboxManager.initialize(createConfig(testDir), undefined, true)
 
     const controller = new AbortController()
-    const command = `(while true; do echo tick >> '${heartbeatPath}'; sleep 0.05; done) & child=$!; wait "$child"`
+    const command = `(while true; do echo tick >> '${heartbeatPath}'; sleep 0.05; done) & child=$!; printf '%s' "$child" > '${childPidPath}'; wait "$child"`
     const runPromise = executeSandboxedCommand(command, {
       abortSignal: controller.signal,
     }).catch(error => error)
 
     await sleep(200)
-    const beforeAbort = readFileSync(heartbeatPath, 'utf8').trim().split('\n').length
+    const childPid = Number.parseInt(readFileSync(childPidPath, 'utf8'), 10)
+    const beforeAbort = readFileSync(heartbeatPath, 'utf8')
+      .trim()
+      .split('\n').length
     controller.abort()
     const error = await runPromise
 
     assert.equal(error instanceof Error, true)
     assert.equal(error.name, 'AbortError')
     await sleep(200)
-    const afterAbort = readFileSync(heartbeatPath, 'utf8').trim().split('\n').length
+    const afterAbort = readFileSync(heartbeatPath, 'utf8')
+      .trim()
+      .split('\n').length
     await sleep(200)
-    const settled = readFileSync(heartbeatPath, 'utf8').trim().split('\n').length
+    const settled = readFileSync(heartbeatPath, 'utf8')
+      .trim()
+      .split('\n').length
 
     assert.ok(beforeAbort >= 1)
     assert.equal(afterAbort, settled)
+    assert.equal(isProcessAlive(childPid), false)
   } finally {
     await SandboxManager.reset()
     rmSync(testDir, { recursive: true, force: true })
   }
 })
+
+test('startSandboxedCommand terminate kills the shell process group', async () => {
+  const testDir = createTestDir()
+  const allowDir = join(testDir, 'allow')
+  const heartbeatPath = join(allowDir, 'managed-heartbeat.log')
+  const childPidPath = join(allowDir, 'managed-child.pid')
+  mkdirSync(allowDir, { recursive: true })
+
+  try {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createConfig(testDir), undefined, true)
+
+    const command = `(while true; do echo tick >> '${heartbeatPath}'; sleep 0.05; done) & child=$!; printf '%s' "$child" > '${childPidPath}'; wait "$child"`
+    const handle = await startSandboxedCommand(command)
+
+    await sleep(200)
+    const childPid = Number.parseInt(readFileSync(childPidPath, 'utf8'), 10)
+    const beforeTerminate = readFileSync(heartbeatPath, 'utf8')
+      .trim()
+      .split('\n').length
+    await handle.terminate({ graceMs: 50 })
+    const result = await handle.wait()
+
+    await sleep(200)
+    const afterTerminate = readFileSync(heartbeatPath, 'utf8')
+      .trim()
+      .split('\n').length
+    await sleep(200)
+    const settled = readFileSync(heartbeatPath, 'utf8')
+      .trim()
+      .split('\n').length
+
+    assert.ok(beforeTerminate >= 1)
+    assert.equal(afterTerminate, settled)
+    assert.equal(result.exitCode, null)
+    assert.ok(result.signal)
+    assert.equal(isProcessAlive(handle.pid), false)
+    assert.equal(isProcessAlive(childPid), false)
+  } finally {
+    await SandboxManager.reset()
+    rmSync(testDir, { recursive: true, force: true })
+  }
+})
+
+test('startSandboxedCommand force-kills descendants that survive graceful termination', async () => {
+  const testDir = createTestDir()
+  const allowDir = join(testDir, 'allow')
+  const childPidPath = join(allowDir, 'stubborn-child.pid')
+  mkdirSync(allowDir, { recursive: true })
+
+  try {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createConfig(testDir), undefined, true)
+
+    const command = `(trap '' TERM; while true; do sleep 1; done) >/dev/null 2>&1 & child=$!; printf '%s' "$child" > '${childPidPath}'; trap 'exit 0' TERM; wait "$child"`
+    const handle = await startSandboxedCommand(command)
+
+    await waitForFile(childPidPath)
+    const childPid = Number.parseInt(readFileSync(childPidPath, 'utf8'), 10)
+    await handle.terminate({ graceMs: 50 })
+    await handle.wait()
+    await sleep(200)
+
+    assert.equal(isProcessAlive(handle.pid), false)
+    assert.equal(isProcessAlive(childPid), false)
+  } finally {
+    await SandboxManager.reset()
+    rmSync(testDir, { recursive: true, force: true })
+  }
+})
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') {
+      return false
+    }
+    throw error
+  }
+}
+
+async function waitForFile(path) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      readFileSync(path)
+      return
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error
+      }
+    }
+    await sleep(25)
+  }
+  throw new Error(`Timed out waiting for ${path}`)
+}

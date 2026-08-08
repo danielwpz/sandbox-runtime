@@ -1,5 +1,27 @@
 # Pokeclaw Fork Notes
 
+## 2026-08-07: managed process handles
+
+- local branch: `feat/managed-process-handle`
+- package version: `0.0.43-pokeclaw.4`
+- change:
+  - added `startSandboxedCommand()` and `SandboxProcessHandle` for live output,
+    repeated `wait()`, and explicit process-tree termination
+  - verify the POSIX process group after graceful termination and force-kill
+    descendants that ignored `SIGTERM`
+  - kept `executeSandboxedCommand()` behavior compatible by implementing it on
+    top of the managed handle
+  - bounded internal stdout/stderr capture while leaving live streams available
+  - scoped macOS sandbox violations per command without clearing global events
+  - fixed macOS nested shell quoting so `$!` and other shell syntax reach the
+    inner command unchanged
+- validation:
+  - `npm run typecheck`
+  - `npm run lint:check`
+  - `npm run build`
+  - `npm test`
+  - `npm run test:node-runtime`
+
 ## 2026-04-27 Issue POK-10: add write deny-only policy mode
 
 - upstream branch: `origin/main`

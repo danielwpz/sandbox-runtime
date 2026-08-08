@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import type { Readable } from 'node:stream'
 import type { SandboxRuntimeConfig } from './sandbox-config.js'
 import type { SandboxViolationEvent } from './macos-sandbox-utils.js'
 import { SandboxManager } from './sandbox-manager.js'
@@ -11,6 +12,8 @@ import { getPlatform } from '../utils/platform.js'
 
 const MACOS_VIOLATION_POLL_INTERVAL_MS = 50
 const MACOS_VIOLATION_TIMEOUT_MS = 500
+const FORCE_KILL_WAIT_MS = 5_000
+const TASKKILL_TIMEOUT_MS = 5_000
 
 export interface SandboxExecOptions {
   binShell?: string
@@ -18,6 +21,7 @@ export interface SandboxExecOptions {
   abortSignal?: AbortSignal
   cwd?: string
   env?: NodeJS.ProcessEnv
+  maxOutputChars?: number
 }
 
 export interface SandboxExecResult {
@@ -27,12 +31,28 @@ export interface SandboxExecResult {
   signal: NodeJS.Signals | null
 }
 
-export async function executeSandboxedCommand(
+export interface SandboxProcessHandle {
+  pid: number | null
+  stdout: Readable | null
+  stderr: Readable | null
+  wait(): Promise<SandboxExecResult>
+  terminate(options?: { graceMs?: number }): Promise<void>
+}
+
+interface WrappedCommandHandle extends SandboxProcessHandle {
+  wait(): Promise<SandboxExecResult>
+}
+
+export async function startSandboxedCommand(
   command: string,
   options: SandboxExecOptions = {},
-): Promise<SandboxExecResult> {
-  SandboxManager.getSandboxViolationStore().clear()
+): Promise<SandboxProcessHandle> {
+  if (options.abortSignal?.aborted) {
+    throw createAbortError()
+  }
 
+  const violationCursor =
+    SandboxManager.getSandboxViolationStore().getTotalCount()
   const scopedNetworkContext = await createScopedNetworkContext(
     options.customConfig,
   )
@@ -41,6 +61,7 @@ export async function executeSandboxedCommand(
     scopedNetworkContext,
   )
 
+  let wrappedHandle: WrappedCommandHandle
   try {
     const wrappedCommand = await SandboxManager.wrapWithSandbox(
       command,
@@ -48,69 +69,126 @@ export async function executeSandboxedCommand(
       scopedCustomConfig,
       options.abortSignal,
     )
+    wrappedHandle = startWrappedCommand(wrappedCommand, options)
+  } catch (error) {
+    await scopedNetworkContext?.close()
+    throw error
+  }
 
-    const result = await runWrappedCommand(wrappedCommand, options)
+  const waitPromise = wrappedHandle
+    .wait()
+    .then(async result => {
+      if (result.exitCode === 0) {
+        return result
+      }
 
-    if (result.exitCode === 0) {
-      return result
-    }
+      const networkIssues = getScopedNetworkIssues(scopedNetworkContext)
+      if (networkIssues.length > 0) {
+        throw new SandboxPermissionError({
+          issues: networkIssues,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          signal: result.signal,
+        })
+      }
 
-    const networkIssues = getScopedNetworkIssues(scopedNetworkContext)
-    if (networkIssues.length > 0) {
+      if (getPlatform() !== 'macos') {
+        return result
+      }
+
+      const fsIssues = await pollMacOsPermissionIssues(command, violationCursor)
+      if (fsIssues.length === 0) {
+        return result
+      }
+
       throw new SandboxPermissionError({
-        issues: networkIssues,
+        issues: fsIssues,
         stdout: result.stdout,
-        stderr: result.stderr,
+        stderr: annotateStderrWithViolations(
+          result.stderr,
+          SandboxManager.getSandboxViolationStore().getViolationsForCommandSince(
+            command,
+            violationCursor,
+          ),
+        ),
         exitCode: result.exitCode,
         signal: result.signal,
       })
-    }
-
-    if (getPlatform() !== 'macos') {
-      return result
-    }
-
-    const fsIssues = await pollMacOsPermissionIssues(command)
-    if (fsIssues.length === 0) {
-      return result
-    }
-
-    throw new SandboxPermissionError({
-      issues: fsIssues,
-      stdout: result.stdout,
-      stderr: SandboxManager.annotateStderrWithSandboxFailures(
-        command,
-        result.stderr,
-      ),
-      exitCode: result.exitCode,
-      signal: result.signal,
     })
-  } finally {
-    await scopedNetworkContext?.close()
+    .finally(async () => {
+      await scopedNetworkContext?.close()
+    })
+
+  // The process starts before callers are required to await it. Attach a
+  // rejection handler immediately so a late wait() call cannot cause an
+  // unhandled rejection in the meantime.
+  void waitPromise.catch(() => {})
+
+  return {
+    pid: wrappedHandle.pid,
+    stdout: wrappedHandle.stdout,
+    stderr: wrappedHandle.stderr,
+    wait: () => waitPromise,
+    terminate: options => wrappedHandle.terminate(options),
   }
 }
 
-async function runWrappedCommand(
+export async function executeSandboxedCommand(
+  command: string,
+  options: SandboxExecOptions = {},
+): Promise<SandboxExecResult> {
+  const handle = await startSandboxedCommand(command, options)
+  return handle.wait()
+}
+
+function startWrappedCommand(
   wrappedCommand: string,
   options: SandboxExecOptions,
-): Promise<SandboxExecResult> {
-  return new Promise((resolve, reject) => {
-    if (options.abortSignal?.aborted) {
-      reject(createAbortError())
-      return
+): WrappedCommandHandle {
+  if (options.abortSignal?.aborted) {
+    throw createAbortError()
+  }
+
+  const child = spawn(wrappedCommand, {
+    shell: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+    ...(options.env ? { env: options.env } : {}),
+  })
+
+  let childClosed = false
+  const childClosePromise = new Promise<void>(resolve => {
+    child.once('close', () => {
+      childClosed = true
+      resolve()
+    })
+  })
+  const waitForClose = async (timeoutMs: number): Promise<boolean> => {
+    if (childClosed) {
+      return true
     }
 
-    const child = spawn(wrappedCommand, {
-      shell: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-      ...(options.cwd ? { cwd: options.cwd } : {}),
-      ...(options.env ? { env: options.env } : {}),
-    })
+    let timeout: ReturnType<typeof setTimeout> | null = null
+    const result = await Promise.race([
+      childClosePromise.then(() => true),
+      new Promise<false>(resolve => {
+        timeout = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+    if (timeout !== null) {
+      clearTimeout(timeout)
+    }
+    return result
+  }
 
+  let terminationPromise: Promise<void> | null = null
+  const waitPromise = new Promise<SandboxExecResult>((resolve, reject) => {
     let stdout = ''
     let stderr = ''
     let settled = false
+    let aborting = false
 
     const finish = (callback: () => void) => {
       if (settled) {
@@ -124,21 +202,35 @@ async function runWrappedCommand(
     }
 
     const onAbort = () => {
-      killCommandTree(child)
-      finish(() => {
-        reject(createAbortError())
-      })
+      aborting = true
+      void terminateCommandTree(child, 0, waitForClose).finally(() =>
+        finish(() => {
+          reject(createAbortError())
+        }),
+      )
     }
 
     if (options.abortSignal) {
       options.abortSignal.addEventListener('abort', onAbort, { once: true })
+      if (options.abortSignal.aborted) {
+        onAbort()
+        return
+      }
     }
 
     child.stdout.on('data', chunk => {
-      stdout += chunk.toString()
+      stdout = appendCapturedOutput(
+        stdout,
+        chunk.toString(),
+        options.maxOutputChars,
+      )
     })
     child.stderr.on('data', chunk => {
-      stderr += chunk.toString()
+      stderr = appendCapturedOutput(
+        stderr,
+        chunk.toString(),
+        options.maxOutputChars,
+      )
     })
     child.on('error', error => {
       finish(() => {
@@ -146,6 +238,9 @@ async function runWrappedCommand(
       })
     })
     child.on('close', (code, signal) => {
+      if (aborting) {
+        return
+      }
       finish(() => {
         resolve({
           stdout,
@@ -156,42 +251,149 @@ async function runWrappedCommand(
       })
     })
   })
+
+  void waitPromise.catch(() => {})
+
+  return {
+    pid: child.pid ?? null,
+    stdout: child.stdout,
+    stderr: child.stderr,
+    wait: () => waitPromise,
+    terminate(terminateOptions = {}): Promise<void> {
+      terminationPromise ??= terminateCommandTree(
+        child,
+        Math.max(0, terminateOptions.graceMs ?? 5_000),
+        waitForClose,
+      )
+      return terminationPromise
+    },
+  }
 }
 
-function killCommandTree(child: ChildProcess): void {
+function appendCapturedOutput(
+  current: string,
+  chunk: string,
+  maxOutputChars: number | undefined,
+): string {
+  if (maxOutputChars === undefined) {
+    return current + chunk
+  }
+  const maxChars = Math.max(0, Math.floor(maxOutputChars))
+  if (maxChars === 0) {
+    return ''
+  }
+  const combined = current + chunk
+  return combined.length <= maxChars ? combined : combined.slice(-maxChars)
+}
+
+async function terminateCommandTree(
+  child: ChildProcess,
+  graceMs: number,
+  waitForClose: (timeoutMs: number) => Promise<boolean>,
+): Promise<void> {
   if (child.pid === undefined || child.pid === null) {
     return
   }
 
-  if (process.platform === 'win32') {
-    try {
-      const killer = spawn(
-        'taskkill',
-        ['/F', '/T', '/PID', String(child.pid)],
-        {
-          stdio: 'ignore',
-          detached: true,
-        },
-      )
-      killer.unref()
-      return
-    } catch {
-      // Fall back to killing the immediate process.
-    }
-  } else {
-    try {
-      process.kill(-child.pid, 'SIGKILL')
-      return
-    } catch {
-      // Fall back to killing the immediate process.
-    }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return
   }
 
-  try {
-    child.kill('SIGKILL')
-  } catch {
-    // Ignore already-dead processes.
+  if (process.platform === 'win32') {
+    if (graceMs > 0) {
+      const requested = await runTaskkill(child.pid, false)
+      if (requested && (await waitForClose(graceMs))) {
+        return
+      }
+    }
+    const killed = await runTaskkill(child.pid, true)
+    if (!killed) {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // The process may already have settled.
+      }
+    }
+    if (!(await waitForClose(FORCE_KILL_WAIT_MS))) {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // Best-effort fallback when taskkill does not settle the parent handle.
+      }
+    }
+    return
+  } else {
+    try {
+      process.kill(-child.pid, graceMs > 0 ? 'SIGTERM' : 'SIGKILL')
+    } catch {
+      try {
+        child.kill(graceMs > 0 ? 'SIGTERM' : 'SIGKILL')
+      } catch {
+        return
+      }
+    }
+
+    if (graceMs > 0) {
+      await waitForClose(graceMs)
+      if (!isPosixProcessGroupAlive(child.pid)) {
+        return
+      }
+    }
+
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+    } catch {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // Ignore already-dead processes.
+      }
+    }
+    await waitForClose(FORCE_KILL_WAIT_MS)
   }
+}
+
+function isPosixProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function runTaskkill(pid: number, force: boolean): Promise<boolean> {
+  return new Promise(resolve => {
+    try {
+      const args = [...(force ? ['/F'] : []), '/T', '/PID', String(pid)]
+      const killer = spawn('taskkill', args, {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      let settled = false
+      const finish = (killed: boolean) => {
+        if (settled) {
+          return
+        }
+        settled = true
+        clearTimeout(timeout)
+        killer.removeAllListeners()
+        resolve(killed)
+      }
+      const timeout = setTimeout(() => {
+        try {
+          killer.kill('SIGKILL')
+        } catch {
+          // Best-effort cleanup if taskkill itself gets stuck.
+        }
+        finish(false)
+      }, TASKKILL_TIMEOUT_MS)
+      killer.once('error', () => finish(false))
+      killer.once('close', code => finish(code === 0))
+    } catch {
+      resolve(false)
+    }
+  })
 }
 
 function createAbortError(): Error {
@@ -220,12 +422,13 @@ function getScopedNetworkIssues(
 
 async function pollMacOsPermissionIssues(
   command: string,
+  afterSequence: number,
 ): Promise<SandboxPermissionIssue[]> {
   const startedAt = Date.now()
   let lastIssues: SandboxPermissionIssue[] = []
 
   while (Date.now() - startedAt <= MACOS_VIOLATION_TIMEOUT_MS) {
-    lastIssues = getMacOsPermissionIssues(command)
+    lastIssues = getMacOsPermissionIssues(command, afterSequence)
     if (lastIssues.length > 0) {
       return lastIssues
     }
@@ -235,12 +438,32 @@ async function pollMacOsPermissionIssues(
   return lastIssues
 }
 
-function getMacOsPermissionIssues(command: string): SandboxPermissionIssue[] {
+function getMacOsPermissionIssues(
+  command: string,
+  afterSequence: number,
+): SandboxPermissionIssue[] {
   const violations =
-    SandboxManager.getSandboxViolationStore().getViolationsForCommand(command)
+    SandboxManager.getSandboxViolationStore().getViolationsForCommandSince(
+      command,
+      afterSequence,
+    )
   return violations
     .map(parseMacOsViolation)
     .filter((issue): issue is SandboxPermissionIssue => issue !== null)
+}
+
+function annotateStderrWithViolations(
+  stderr: string,
+  violations: SandboxViolationEvent[],
+): string {
+  if (violations.length === 0) {
+    return stderr
+  }
+
+  const separator = stderr.length > 0 && !stderr.endsWith('\n') ? '\n' : ''
+  return `${stderr}${separator}<sandbox_violations>\n${violations
+    .map(violation => violation.line)
+    .join('\n')}\n</sandbox_violations>`
 }
 
 function parseMacOsViolation(
