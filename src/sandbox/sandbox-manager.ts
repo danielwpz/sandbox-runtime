@@ -275,10 +275,18 @@ async function initialize(
 
   // Start log monitor for macOS if enabled
   if (enableLogMonitor && getPlatform() === 'macos') {
-    logMonitorShutdown = startMacOSSandboxLogMonitor(
+    const logMonitor = startMacOSSandboxLogMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       config.ignoreViolations,
     )
+    logMonitorShutdown = logMonitor.shutdown
+    try {
+      await logMonitor.ready
+    } catch (error) {
+      logMonitor.shutdown()
+      logMonitorShutdown = undefined
+      throw error
+    }
     logForDebugging('Started macOS sandbox log monitor')
   }
 
