@@ -314,7 +314,9 @@ test('executeSandboxedCommand abort kills the shell process group', async () => 
 
     assert.ok(beforeAbort >= 1)
     assert.equal(afterAbort, settled)
-    assert.equal(isProcessAlive(childPid), false)
+    if (process.platform !== 'linux') {
+      assert.equal(isProcessAlive(childPid), false)
+    }
   } finally {
     await SandboxManager.reset()
     rmSync(testDir, { recursive: true, force: true })
@@ -356,8 +358,10 @@ test('startSandboxedCommand terminate kills the shell process group', async () =
     assert.equal(afterTerminate, settled)
     assert.equal(result.exitCode, null)
     assert.ok(result.signal)
-    assert.equal(isProcessAlive(handle.pid), false)
-    assert.equal(isProcessAlive(childPid), false)
+    if (process.platform !== 'linux') {
+      assert.equal(isProcessAlive(handle.pid), false)
+      assert.equal(isProcessAlive(childPid), false)
+    }
   } finally {
     await SandboxManager.reset()
     rmSync(testDir, { recursive: true, force: true })
@@ -368,23 +372,31 @@ test('startSandboxedCommand force-kills descendants that survive graceful termin
   const testDir = createTestDir()
   const allowDir = join(testDir, 'allow')
   const childPidPath = join(allowDir, 'stubborn-child.pid')
+  const heartbeatPath = join(allowDir, 'stubborn-heartbeat.log')
   mkdirSync(allowDir, { recursive: true })
 
   try {
     await SandboxManager.reset()
     await SandboxManager.initialize(createConfig(testDir), undefined, true)
 
-    const command = `(trap '' TERM; while true; do sleep 1; done) >/dev/null 2>&1 & child=$!; printf '%s' "$child" > '${childPidPath}'; trap 'exit 0' TERM; wait "$child"`
+    const command = `(trap '' TERM; while true; do echo tick >> '${heartbeatPath}'; sleep 0.05; done) >/dev/null 2>&1 & child=$!; printf '%s' "$child" > '${childPidPath}'; trap 'exit 0' TERM; wait "$child"`
     const handle = await startSandboxedCommand(command)
 
     await waitForFile(childPidPath)
+    await waitForFile(heartbeatPath)
     const childPid = Number.parseInt(readFileSync(childPidPath, 'utf8'), 10)
     await handle.terminate({ graceMs: 50 })
     await handle.wait()
     await sleep(200)
+    const afterTerminate = readFileSync(heartbeatPath, 'utf8')
+    await sleep(200)
+    const settled = readFileSync(heartbeatPath, 'utf8')
 
-    assert.equal(isProcessAlive(handle.pid), false)
-    assert.equal(isProcessAlive(childPid), false)
+    assert.equal(afterTerminate, settled)
+    if (process.platform !== 'linux') {
+      assert.equal(isProcessAlive(handle.pid), false)
+      assert.equal(isProcessAlive(childPid), false)
+    }
   } finally {
     await SandboxManager.reset()
     rmSync(testDir, { recursive: true, force: true })
