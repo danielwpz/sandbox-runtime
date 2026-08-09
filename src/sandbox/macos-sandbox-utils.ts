@@ -1,4 +1,3 @@
-import shellquote from 'shell-quote'
 import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
@@ -87,6 +86,13 @@ export type SandboxViolationCallback = (
 ) => void
 
 const sessionSuffix = `_${Math.random().toString(36).slice(2, 11)}_SBX`
+const LOG_MONITOR_READY_TIMEOUT_MS = 5_000
+const LOG_MONITOR_READY_RETRY_MS = 100
+
+export interface MacOSSandboxLogMonitor {
+  ready: Promise<void>
+  shutdown(): void
+}
 
 /**
  * Generate a unique log tag for sandbox monitoring
@@ -957,9 +963,10 @@ export function wrapCommandWithSandboxMacOS(
     throw new Error(`Shell '${shellName}' not found in PATH`)
   }
 
-  // Use `env` command to set environment variables - each VAR=value is a separate
-  // argument that shellquote handles properly, avoiding shell quoting issues
-  const wrappedCommand = shellquote.quote([
+  // Use `env` command to set environment variables. Quote every argv element
+  // with POSIX single-quote semantics so shell parameters such as `$!` survive
+  // the outer launcher and are expanded only by the requested inner shell.
+  const wrappedCommand = quoteShellArgs([
     'env',
     ...proxyEnvArgs,
     'sandbox-exec',
@@ -979,6 +986,22 @@ export function wrapCommandWithSandboxMacOS(
   return wrappedCommand
 }
 
+function quoteShellArg(arg: string): string {
+  if (arg === '') {
+    return "''"
+  }
+
+  if (/^[A-Za-z0-9_/:=.,+-]+$/.test(arg)) {
+    return arg
+  }
+
+  return `'${arg.replace(/'/g, "'\\''")}'`
+}
+
+function quoteShellArgs(args: string[]): string {
+  return args.map(quoteShellArg).join(' ')
+}
+
 /**
  * Start monitoring macOS system logs for sandbox violations
  * Look for sandbox-related kernel deny events ending in {logTag}
@@ -986,7 +1009,7 @@ export function wrapCommandWithSandboxMacOS(
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
   ignoreViolations?: IgnoreViolationsConfig,
-): () => void {
+): MacOSSandboxLogMonitor {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
@@ -1007,8 +1030,75 @@ export function startMacOSSandboxLogMonitor(
     'compact',
   ])
 
+  const readinessMarker = `POKOCLAW_LOG_MONITOR_READY_${Math.random()
+    .toString(36)
+    .slice(2)}${sessionSuffix}`
+  let stopped = false
+  let readySettled = false
+  let readinessProbeTimer: ReturnType<typeof setTimeout> | undefined
+  let readinessBuffer = ''
+  let resolveReady: (() => void) | undefined
+  let rejectReady: ((error: Error) => void) | undefined
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+
+  const settleReady = (error?: Error): void => {
+    if (readySettled) {
+      return
+    }
+    readySettled = true
+    if (readinessProbeTimer) {
+      clearTimeout(readinessProbeTimer)
+    }
+    if (readinessTimeout) {
+      clearTimeout(readinessTimeout)
+    }
+    if (error) {
+      rejectReady?.(error)
+    } else {
+      resolveReady?.()
+    }
+  }
+
+  const sendReadinessProbe = (): void => {
+    if (stopped || readySettled) {
+      return
+    }
+    const probe = spawn('/usr/bin/logger', [readinessMarker], {
+      stdio: 'ignore',
+    })
+    probe.once('error', error => {
+      settleReady(
+        new Error(
+          `Failed to probe macOS sandbox log monitor: ${error.message}`,
+        ),
+      )
+    })
+    readinessProbeTimer = setTimeout(
+      sendReadinessProbe,
+      LOG_MONITOR_READY_RETRY_MS,
+    )
+  }
+
+  logProcess.once('spawn', () => {
+    sendReadinessProbe()
+  })
+  const readinessTimeout = setTimeout(() => {
+    settleReady(new Error('Timed out starting macOS sandbox log monitor'))
+  }, LOG_MONITOR_READY_TIMEOUT_MS)
+
   logProcess.stdout?.on('data', (data: Buffer) => {
-    const lines = data.toString().split('\n')
+    const text = data.toString()
+    readinessBuffer = `${readinessBuffer}${text}`.slice(
+      -readinessMarker.length * 2,
+    )
+    if (readinessBuffer.includes(readinessMarker)) {
+      settleReady()
+    }
+
+    const lines = text.split('\n')
 
     // Get violation and command lines
     const violationLine = lines.find(
@@ -1083,17 +1173,30 @@ export function startMacOSSandboxLogMonitor(
   })
 
   logProcess.on('error', (error: Error) => {
+    settleReady(
+      new Error(`Failed to start macOS sandbox log monitor: ${error.message}`),
+    )
     logForDebugging(
       `[Sandbox Monitor] Failed to start log stream: ${error.message}`,
     )
   })
 
   logProcess.on('exit', (code: number | null) => {
+    if (!stopped) {
+      settleReady(
+        new Error(`macOS sandbox log monitor exited with code: ${code}`),
+      )
+    }
     logForDebugging(`[Sandbox Monitor] Log stream exited with code: ${code}`)
   })
 
-  return () => {
-    logForDebugging('[Sandbox Monitor] Stopping log monitor')
-    logProcess.kill('SIGTERM')
+  return {
+    ready,
+    shutdown: () => {
+      stopped = true
+      settleReady(new Error('macOS sandbox log monitor stopped'))
+      logForDebugging('[Sandbox Monitor] Stopping log monitor')
+      logProcess.kill('SIGTERM')
+    },
   }
 }

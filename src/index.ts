@@ -3,8 +3,10 @@ export { SandboxManager } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 export {
   executeSandboxedCommand,
+  startSandboxedCommand,
   type SandboxExecOptions,
   type SandboxExecResult,
+  type SandboxProcessHandle,
 } from './sandbox/sandbox-exec.js'
 export {
   SandboxPermissionError,
